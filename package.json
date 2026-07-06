@@ -1,0 +1,23 @@
+{
+  "name": "ai-gateway",
+  "version": "1.0.0",
+  "description": "Local-first AI API gateway with multi-provider routing, key pooling, and automatic failover",
+  "type": "module",
+  "scripts": {
+    "dev": "npx tsx watch src/index.ts",
+    "start": "npx tsx src/index.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "itty-router": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.9"
+  }
+}

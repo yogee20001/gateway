@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Gateway Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <span class="header-logo">◉</span>
+      <span class="header-title">AI Gateway</span>
+      <span class="header-tagline">One endpoint. Any provider. Maximum reliability.</span>
+    </div>
+    <div class="header-right">
+      <span class="status-indicator" id="statusIndicator">● Running</span>
+      <span class="port-display" id="portDisplay">:8787</span>
+    </div>
+  </header>
+
+  <!-- Stats Bar -->
+  <section class="stats-bar" id="statsBar">
+    <div class="stat-card">
+      <span class="stat-label">Total Requests</span>
+      <span class="stat-value" id="statTotal">0</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Today</span>
+      <span class="stat-value" id="statToday">0</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Active Providers</span>
+      <span class="stat-value" id="statActiveProviders">0</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Errors</span>
+      <span class="stat-value" id="statErrors">0</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Avg Response</span>
+      <span class="stat-value" id="statAvgDuration">0ms</span>
+    </div>
+  </section>
+
+  <!-- Providers Section -->
+  <section class="section">
+    <div class="section-header">
+      <h2>Providers</h2>
+      <button class="btn btn-primary" id="addProviderBtn">+ Add Provider</button>
+    </div>
+    <div class="providers-grid" id="providersGrid">
+      <!-- Provider cards rendered by JS -->
+    </div>
+    <div class="empty-state" id="emptyProviders">
+      <div class="empty-icon">🔧</div>
+      <h3>No providers configured yet</h3>
+      <p>Add your first AI provider to start routing requests. You'll need at least one API key to get started.</p>
+      <button class="btn btn-primary" id="emptyAddProviderBtn">+ Add Your First Provider</button>
+    </div>
+  </section>
+
+  <!-- Logs Section -->
+  <section class="section">
+    <div class="section-header">
+      <h2>Recent Activity</h2>
+      <div class="section-actions">
+        <span class="auto-refresh-badge" id="autoRefreshBadge">🔄 Auto-refresh (2s)</span>
+        <button class="btn btn-sm" id="clearLogsBtn">Clear Logs</button>
+      </div>
+    </div>
+    <div class="log-table-container">
+      <table class="log-table" id="logTable">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Model</th>
+            <th>Provider</th>
+            <th>Key</th>
+            <th>Status</th>
+            <th>Duration</th>
+            <th>Retries</th>
+          </tr>
+        </thead>
+        <tbody id="logBody">
+          <!-- Log entries rendered by JS -->
+        </tbody>
+      </table>
+    </div>
+    <div class="empty-state" id="emptyLogs">
+      <div class="empty-icon">📭</div>
+      <h3>No requests yet</h3>
+      <p>Send a request to /v1/chat/completions to see logs here.</p>
+      <pre class="example-curl">curl http://localhost:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'</pre>
+    </div>
+  </section>
+
+  <!-- Add/Edit Provider Modal -->
+  <div class="modal-overlay" id="providerModal">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h3 id="modalTitle">Add Provider</h3>
+        <button class="modal-close" id="modalCloseBtn">✕</button>
+      </div>
+      <div class="modal-body">
+        <form id="providerForm" onsubmit="return false;">
+          <input type="hidden" id="editProviderIndex" value="-1">
+
+          <div class="form-row">
+            <div class="form-group form-group-half">
+              <label for="providerId">Provider ID *</label>
+              <input type="text" id="providerId" class="form-input" placeholder="openai" required pattern="[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?">
+              <span class="form-error" id="providerIdError"></span>
+            </div>
+            <div class="form-group form-group-half">
+              <label for="providerName">Display Name *</label>
+              <input type="text" id="providerName" class="form-input" placeholder="OpenAI" required>
+              <span class="form-error" id="providerNameError"></span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="providerBaseUrl">Base URL *</label>
+            <input type="url" id="providerBaseUrl" class="form-input" placeholder="https://api.openai.com/v1" required>
+            <span class="form-error" id="providerBaseUrlError"></span>
+          </div>
+
+          <!-- Model Patterns - Tag-based UI -->
+          <div class="form-group">
+            <label>Model Patterns</label>
+            <div class="patterns-container" id="patternsContainer">
+              <div class="patterns-tags" id="patternsTags">
+                <!-- Pattern chips rendered by JS -->
+              </div>
+              <div class="patterns-input-row">
+                <input type="text" id="patternInput" class="form-input pattern-input" placeholder="e.g. gpt-*, claude-*, nvidia/*" 
+                       onkeydown="if(event.key==='Enter'){event.preventDefault();addPattern();}">
+                <button type="button" class="btn btn-sm" onclick="addPattern()">+ Add</button>
+              </div>
+            </div>
+            <div class="patterns-quick-add">
+              <span class="quick-add-label">Quick add:</span>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('*')">All models (*)</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('gpt-*')">GPT</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('claude-*')">Claude</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('gemini-*')">Gemini</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('nvidia/*')">NVIDIA</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('meta/*')">Meta</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('deepseek-*')">DeepSeek</button>
+              <button type="button" class="btn btn-xs" onclick="addQuickPattern('mistralai/*')">Mistral</button>
+            </div>
+            <span class="form-help">Patterns use glob syntax: `*` matches anything. E.g. `gpt-*` matches gpt-4o, gpt-4-turbo</span>
+            <span class="form-error" id="patternsError"></span>
+          </div>
+
+          <!-- API Keys - Tag-based UI -->
+          <div class="form-group">
+            <label>API Keys *</label>
+            <div class="patterns-container" id="apiKeysContainer">
+              <div class="patterns-tags" id="apiKeysTags">
+                <!-- Key tag chips rendered by JS -->
+              </div>
+              <div class="patterns-input-row">
+                <input type="password" id="apiKeyInput" class="form-input pattern-input" placeholder="sk-... or nvapi-..." 
+                       onkeydown="if(event.key==='Enter'){event.preventDefault();addApiKey();}">
+                <button type="button" class="btn btn-sm" onclick="addApiKey()">+ Add</button>
+              </div>
+            </div>
+            <span class="form-help">Type or paste an API key and press Enter to add it. Keys are saved permanently.</span>
+            <span class="form-error" id="apiKeysError"></span>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group form-group-half">
+              <label for="keyStrategy">Key Strategy</label>
+              <select id="keyStrategy" class="form-input">
+                <option value="round-robin">Round Robin</option>
+                <option value="least-used">Least Used</option>
+                <option value="random">Random</option>
+              </select>
+            </div>
+            <div class="form-group form-group-half form-toggle">
+              <label class="toggle-label">
+                <input type="checkbox" id="providerActive" checked>
+                <span class="toggle-switch"></span>
+                Active (enabled)
+              </label>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" id="modalCancelBtn">Cancel</button>
+        <button class="btn btn-primary" id="modalSaveBtn">Save Provider</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>
