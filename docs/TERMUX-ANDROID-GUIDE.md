@@ -108,8 +108,8 @@ The project includes an automated setup script that does everything for you:
 # In Termux, run these 3 commands:
 pkg update && pkg upgrade -y
 pkg install git -y
-git clone https://github.com/yourusername/ai-gateway.git
-cd ai-gateway
+git clone https://github.com/yogee20001/gateway.git
+cd gateway
 bash scripts/termux-setup.sh
 ```
 
@@ -132,19 +132,16 @@ The script will:
 cd ~
 
 # Clone the repository
-git clone https://github.com/yourusername/ai-gateway.git
-
-# Or if you have your own fork:
-# git clone https://github.com/YOUR_USERNAME/ai-gateway.git
+git clone https://github.com/yogee20001/gateway.git
 
 # Enter the project directory
-cd ai-gateway
+cd gateway
 ```
 
 > 💡 **Tip**: If you want to use your own modified version, you can transfer files via USB or use `scp`/`rsync` to copy the project from your computer to your phone's `~/storage/downloads/` folder, then copy it to Termux:
 > ```bash
-> cp -r ~/storage/downloads/ai-gateway ~/
-> cd ~/ai-gateway
+> cp -r ~/storage/downloads/gateway ~/
+> cd ~/gateway
 > ```
 
 #### Step 6: Install Dependencies
@@ -227,7 +224,7 @@ pkg install tmux -y
 tmux new -s gateway
 
 # Start the gateway inside tmux
-cd ~/ai-gateway
+cd ~/gateway
 npm start
 ```
 
@@ -253,7 +250,7 @@ tmux kill-session -t gateway
 
 ```bash
 # Start in background, output to a log file
-cd ~/ai-gateway
+cd ~/gateway
 nohup npm start > gateway.log 2>&1 &
 
 # Check if it's running
@@ -278,7 +275,7 @@ pkg install termux-api -y
 termux-wake-lock
 
 # Start gateway
-cd ~/ai-gateway
+cd ~/gateway
 npm start
 ```
 
@@ -304,7 +301,7 @@ termux-wake-unlock
 mkdir -p ~/.termux/boot/
 
 # Create a startup script
-cat > ~/.termux/boot/ai-gateway.sh << 'EOF'
+cat > ~/.termux/boot/gateway.sh << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # AI Gateway — Auto-start on boot
 
@@ -312,7 +309,7 @@ cat > ~/.termux/boot/ai-gateway.sh << 'EOF'
 sleep 10
 
 # Start gateway in tmux
-cd ~/ai-gateway
+cd ~/gateway
 tmux new-session -d -s gateway 'npm start'
 
 # Optional: acquire wake lock to prevent sleep
@@ -320,14 +317,14 @@ tmux new-session -d -s gateway 'npm start'
 EOF
 
 # Make it executable
-chmod +x ~/.termux/boot/ai-gateway.sh
+chmod +x ~/.termux/boot/gateway.sh
 ```
 
 ### Step 3: Test the Boot Script
 
 ```bash
 # Run the script manually to verify it works
-bash ~/.termux/boot/ai-gateway.sh
+bash ~/.termux/boot/gateway.sh
 
 # Check if gateway started
 tmux attach -t gateway
@@ -357,13 +354,11 @@ ifconfig
 Stop the gateway if running (`Ctrl+C`), then start it on `0.0.0.0`:
 
 ```bash
-# Method 1: Set environment variable
+# Method 1: Set environment variable (recommended)
 HOST=0.0.0.0 npx tsx src/index.ts
 
-# Method 2: Or modify the port binding (one-time change)
-# Edit src/index.ts and change line 662:
-# From: server.listen(port, '127.0.0.1', () => {
-# To:   server.listen(port, '0.0.0.0', () => {
+# Method 2: Or use the helper script
+bash start-remote.sh
 ```
 
 ### Step 3: Access from Other Devices
@@ -465,7 +460,7 @@ Android may kill background processes to save battery:
 pkg install tmux -y
 tmux new -s gateway
 # Then start the gateway inside tmux
-cd ~/ai-gateway && npm start
+cd ~/gateway && npm start
 # Ctrl+B, D to detach — gateway keeps running
 ```
 
@@ -519,17 +514,17 @@ You can use [Tasker](https://play.google.com/store/apps/details?id=net.dinglisch
 
 1. **Start Gateway Task**:
    - Action: "Send Intent" → `com.termux.RUN_COMMAND`
-   - Extra: `com.termux.RUN_COMMAND_PATH` = `/data/data/com.termux/files/home/ai-gateway/start.sh`
-   - Create `~/ai-gateway/start.sh`:
+   - Extra: `com.termux.RUN_COMMAND_PATH` = `/data/data/com.termux/files/home/gateway/start.sh`
+   - Create `~/gateway/start.sh`:
      ```bash
      #!/data/data/com.termux/files/usr/bin/bash
-     cd ~/ai-gateway
+     cd ~/gateway
      tmux new-session -d -s gateway 'npm start'
      ```
 
 2. **Stop Gateway Task**:
-   - Extra: `com.termux.RUN_COMMAND_PATH` = `/data/data/com.termux/files/home/ai-gateway/stop.sh`
-   - Create `~/ai-gateway/stop.sh`:
+   - Extra: `com.termux.RUN_COMMAND_PATH` = `/data/data/com.termux/files/home/gateway/stop.sh`
+   - Create `~/gateway/stop.sh`:
      ```bash
      #!/data/data/com.termux/files/usr/bin/bash
      tmux kill-session -t gateway
@@ -574,7 +569,7 @@ ps aux | grep node
 df -h
 
 # Check Termux data size
-du -sh ~/ai-gateway
+du -sh ~/gateway
 ```
 
 ### Network Performance
@@ -602,14 +597,14 @@ iw dev wlan0 link
 # First time setup
 pkg update && pkg upgrade -y
 pkg install nodejs git tmux -y
-git clone https://github.com/yourusername/ai-gateway.git
-cd ai-gateway && npm install
+git clone https://github.com/yogee20001/gateway.git
+cd gateway && npm install
 
 # Start
-cd ~/ai-gateway && npm start
+cd ~/gateway && npm start
 
 # Start in background (tmux)
-tmux new -s gateway -d 'cd ~/ai-gateway && npm start'
+tmux new -s gateway -d 'cd ~/gateway && npm start'
 
 # Reattach to tmux
 tmux attach -t gateway
@@ -631,13 +626,13 @@ HOST=0.0.0.0 npx tsx src/index.ts
 
 # Auto-start on boot
 mkdir -p ~/.termux/boot/
-cat > ~/.termux/boot/ai-gateway.sh << 'EOF'
+cat > ~/.termux/boot/gateway.sh << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 sleep 10
-cd ~/ai-gateway
+cd ~/gateway
 tmux new-session -d -s gateway 'npm start'
 EOF
-chmod +x ~/.termux/boot/ai-gateway.sh
+chmod +x ~/.termux/boot/gateway.sh
 ```
 
 ---

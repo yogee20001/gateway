@@ -6,7 +6,7 @@
 # start the AI Gateway on your Android phone.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/yourusername/ai-gateway/main/scripts/termux-setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/yogee20001/gateway/main/scripts/termux-setup.sh | bash
 #
 # Or after cloning:
 #   bash scripts/termux-setup.sh
@@ -76,8 +76,8 @@ echo "  Git:     $(git --version 2>&1 | head -1)"
 echo ""
 echo -e "${BLUE}[4/7]${NC} Setting up AI Gateway..."
 
-REPO_URL="${1:-https://github.com/yourusername/ai-gateway.git}"
-TARGET_DIR="$HOME/ai-gateway"
+REPO_URL="${1:-https://github.com/yogee20001/gateway.git}"
+TARGET_DIR="$HOME/gateway"
 
 if [ -d "$TARGET_DIR" ]; then
     echo -e "${YELLOW}⚠ Directory $TARGET_DIR already exists.${NC}"
@@ -254,7 +254,7 @@ cat > "$BOOT_DIR/ai-gateway.sh" << 'EOF'
 sleep 15
 
 # Start gateway in tmux session
-cd ~/ai-gateway
+cd ~/gateway
 tmux new-session -d -s gateway 'npx tsx src/index.ts' 2>/dev/null
 
 # Optional: Show notification that gateway started
@@ -284,7 +284,7 @@ echo "   AI Gateway is installed at: $TARGET_DIR"
 echo ""
 echo "   Quick Start:"
 echo "   ─────────────────────────────────────────────"
-echo "   cd ~/ai-gateway"
+echo "   cd ~/gateway"
 echo "   bash start-bg.sh     # Start in background"
 echo "   bash status.sh       # Check status"
 echo "   bash stop.sh         # Stop the gateway"
