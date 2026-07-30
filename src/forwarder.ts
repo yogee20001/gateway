@@ -104,7 +104,6 @@ export async function forwardNonStreaming(
           || (typeof responseBody?.error?.message === 'string' && responseBody.error.message.includes('Worker local total request limit reached'));
         if (isResourceExhausted) {
           console.log('[forwarder] Provider returned ResourceExhausted in 200 response for ' + provider.id + ' key ' + keyResult.index + ' � treating as 429');
-          markKeyRateLimited(provider.id, keyResult.index, 60000);
           return {
             status: 429,
             body: responseBody,

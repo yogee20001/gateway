@@ -1,5 +1,5 @@
-// ============================================================
-// AI Gateway — Provider-Level Rate Limiting (Optimized)
+﻿// ============================================================
+// AI Gateway ΓÇö Provider-Level Rate Limiting (Optimized)
 // ============================================================
 
 import type { Provider } from './types';
@@ -10,6 +10,10 @@ export interface RateLimitConfig {
   windowMs: number;
   maxConcurrent?: number; // Per-key concurrency limit (default: 4)
   providerMaxConcurrent?: number; // Provider-wide concurrency limit (default: Infinity)
+  /** Provider-level shared rate limit (total across all keys). Default: 0 (disabled) */
+  providerRequestsPerWindow?: number;
+  /** Provider-level shared rate limit window. Default: same as windowMs */
+  providerWindowMs?: number;
 }
 
 export interface ParsedRateLimitInfo {
@@ -35,6 +39,13 @@ export interface ProviderRateLimitState {
   globalConfig: RateLimitConfig;
   inFlight: number; // Total in-flight across all keys
   providerMaxConcurrent: number; // Provider-wide max concurrent
+  // Provider-level shared token bucket (total across all keys)
+  providerTokens: number;
+  providerLastRefill: number;
+  providerRequestsPerWindow: number;
+  providerWindowMs: number;
+  providerQueue: Array<() => void>;
+  providerQueueProcessing: boolean;
 }
 
 /**
@@ -120,6 +131,12 @@ export class ProviderRateLimiter {
         globalConfig: config,
         inFlight: 0,
         providerMaxConcurrent: config.providerMaxConcurrent ?? Infinity,
+      providerTokens: config.providerRequestsPerWindow ?? 0,
+      providerLastRefill: Date.now(),
+      providerRequestsPerWindow: config.providerRequestsPerWindow ?? 0,
+      providerWindowMs: config.providerWindowMs ?? config.windowMs,
+      providerQueue: [],
+      providerQueueProcessing: false,
       });
     }
   }
@@ -154,7 +171,10 @@ export class ProviderRateLimiter {
    */
   async acquire(providerId: string, keyHash: string): Promise<void> {
     const config = this.configs.get(providerId);
-    if (!config) return;
+    if (!config) {
+      console.warn('[rate-limiter] No config for provider "' + providerId + '" - rate limiting BYPASSED');
+      return;
+    }
 
     const keyState = this.getKeyState(providerId, keyHash, config);
     const providerState = this.states.get(providerId);
@@ -174,6 +194,18 @@ export class ProviderRateLimiter {
         keyState.queuedRequests.push(resolve);
         this.processQueue(providerId, keyHash, config);
       });
+    }
+
+    // Check provider-level shared token bucket
+    if (providerState && providerState.providerRequestsPerWindow > 0) {
+      this.refillProviderIfNeeded(providerState);
+      if (providerState.providerTokens <= 0) {
+        return new Promise<void>((resolve) => {
+          providerState.providerQueue.push(resolve);
+          this.processProviderQueue(providerId);
+        });
+      }
+      providerState.providerTokens--;
     }
 
     if (keyState.tokens > 0) {
@@ -203,6 +235,7 @@ export class ProviderRateLimiter {
       if (providerState.inFlight > 0) providerState.inFlight--;
       this.processQueue(providerId, keyHash, config);
     }
+    this.processProviderQueue(providerId);
   }
 
   async waitForSlot(providerId: string, keyHash?: string): Promise<void> {
@@ -218,7 +251,10 @@ export class ProviderRateLimiter {
    */
   private async acquireGlobal(providerId: string): Promise<void> {
     const config = this.configs.get(providerId);
-    if (!config) return;
+    if (!config) {
+      console.warn('[rate-limiter] No config for provider "' + providerId + '" - rate limiting BYPASSED');
+      return;
+    }
 
     let state = this.states.get(providerId);
     if (!state) {
@@ -227,6 +263,12 @@ export class ProviderRateLimiter {
         globalConfig: config,
         inFlight: 0,
         providerMaxConcurrent: config.providerMaxConcurrent ?? Infinity,
+        providerTokens: config.providerRequestsPerWindow ?? 0,
+        providerLastRefill: Date.now(),
+        providerRequestsPerWindow: config.providerRequestsPerWindow ?? 0,
+        providerWindowMs: config.providerWindowMs ?? config.windowMs,
+        providerQueue: [],
+        providerQueueProcessing: false,
       };
       this.states.set(providerId, state);
     }
@@ -236,8 +278,6 @@ export class ProviderRateLimiter {
     
     this.refillIfNeeded(config, keyState);
 
-    if (keyState.tokens > 0) {
-
     // Check provider-level concurrency
     if (state && state.inFlight >= state.providerMaxConcurrent) {
       return new Promise<void>((resolve) => {
@@ -245,6 +285,20 @@ export class ProviderRateLimiter {
         this.processQueue(providerId, '__global__', config);
       });
     }
+
+    // Check provider-level shared token bucket
+    if (state && state.providerRequestsPerWindow > 0) {
+      this.refillProviderIfNeeded(state);
+      if (state.providerTokens <= 0) {
+        return new Promise<void>((resolve) => {
+          state.providerQueue.push(resolve);
+          this.processProviderQueue(providerId);
+        });
+      }
+      state.providerTokens--;
+    }
+
+    if (keyState.tokens > 0) {
       keyState.tokens--;
       state.inFlight++;
       return;
@@ -312,6 +366,17 @@ export class ProviderRateLimiter {
     }
   }
 
+  private refillProviderIfNeeded(state: ProviderRateLimitState): void {
+    if (state.providerRequestsPerWindow <= 0) return;
+    const now = Date.now();
+    const elapsed = now - state.providerLastRefill;
+
+    if (elapsed >= state.providerWindowMs) {
+      state.providerTokens = state.providerRequestsPerWindow;
+      state.providerLastRefill = now;
+    }
+  }
+
   private refillKey(providerId: string, keyHash: string): void {
     const config = this.configs.get(providerId);
     const providerState = this.states.get(providerId);
@@ -320,8 +385,10 @@ export class ProviderRateLimiter {
     const keyState = providerState.keys.get(keyHash);
     if (!keyState) return;
 
-    keyState.tokens = config.requestsPerWindow;
-    keyState.lastRefill = Date.now();
+    if (keyState.tokens < config.requestsPerWindow) {
+      keyState.tokens = config.requestsPerWindow;
+      keyState.lastRefill = Date.now();
+    }
     this.processQueue(providerId, keyHash, config);
   }
 
@@ -348,16 +415,45 @@ export class ProviderRateLimiter {
     if (keyState.queuedRequests.length > 0 && keyState.tokens === 0) {
       const nextRefill = keyState.lastRefill + config.windowMs;
       const delay = Math.max(0, nextRefill - Date.now());
-      setTimeout(() => {
-        this.refillKey(providerId, keyHash);
-      }, delay);
+      if (delay > 10) {
+        setTimeout(() => {
+          this.refillKey(providerId, keyHash);
+        }, delay);
+      }
+    }
+  }
+
+  private processProviderQueue(providerId: string): void {
+    const providerState = this.states.get(providerId);
+    if (!providerState) return;
+
+    this.refillProviderIfNeeded(providerState);
+    if (providerState.providerQueueProcessing) return;
+    providerState.providerQueueProcessing = true;
+
+    while (providerState.providerTokens > 0 && providerState.providerQueue.length > 0) {
+      providerState.providerTokens--;
+      const resolve = providerState.providerQueue.shift();
+      if (resolve) resolve();
+    }
+
+    providerState.providerQueueProcessing = false;
+
+    if (providerState.providerQueue.length > 0 && providerState.providerTokens <= 0) {
+      const nextRefill = providerState.providerLastRefill + providerState.providerWindowMs;
+      const delay = Math.max(0, nextRefill - Date.now());
+      if (delay > 10) {
+        setTimeout(() => {
+          this.processProviderQueue(providerId);
+        }, delay);
+      }
     }
   }
 
   /**
    * Get current rate limit status for a provider
    */
-  getStatus(providerId: string): { tokens: number; limit: number; windowMs: number; keyCount: number } | null {
+  getStatus(providerId: string): { tokens: number; limit: number; windowMs: number; keyCount: number; providerTokens?: number; providerLimit?: number } | null {
     const config = this.configs.get(providerId);
     const providerState = this.states.get(providerId);
     if (!config || !providerState) return null;
@@ -369,12 +465,20 @@ export class ProviderRateLimiter {
       totalTokens += keyState.tokens;
     }
 
-    return {
+    const result: { tokens: number; limit: number; windowMs: number; keyCount: number; providerTokens?: number; providerLimit?: number } = {
       tokens: totalTokens,
       limit: config.requestsPerWindow * providerState.keys.size,
       windowMs: config.windowMs,
       keyCount: providerState.keys.size,
     };
+
+    if (providerState.providerRequestsPerWindow > 0) {
+      this.refillProviderIfNeeded(providerState);
+      result.providerTokens = providerState.providerTokens;
+      result.providerLimit = providerState.providerRequestsPerWindow;
+    }
+
+    return result;
   }
 
   /**
@@ -408,6 +512,12 @@ export class ProviderRateLimiter {
         globalConfig: config,
         inFlight: 0,
         providerMaxConcurrent: config.providerMaxConcurrent ?? Infinity,
+      providerTokens: config.providerRequestsPerWindow ?? 0,
+      providerLastRefill: Date.now(),
+      providerRequestsPerWindow: config.providerRequestsPerWindow ?? 0,
+      providerWindowMs: config.providerWindowMs ?? config.windowMs,
+      providerQueue: [],
+      providerQueueProcessing: false,
       });
     }
   }
@@ -426,7 +536,7 @@ export const DEFAULT_PROVIDER_RATE_LIMITS: Record<string, RateLimitConfig> = {
   anthropic: { requestsPerWindow: 50, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 50 },
   google: { requestsPerWindow: 60, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 60 },
   deepseek: { requestsPerWindow: 60, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 60 },
-  nvidia: { requestsPerWindow: 32, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 32 },
+  nvidia: { requestsPerWindow: 32, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 32, providerRequestsPerWindow: 32 },
   perplexity: { requestsPerWindow: 50, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 50 },
 };
 
