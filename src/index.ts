@@ -14,11 +14,12 @@ const __dirname = dirname(__filename);
 import { findProvidersForModel } from './router';
 import { initializeKeyStates, startHealthCheckTimer, stopHealthCheckTimer, getKeyHealthSummary, setProviders } from './key-pool';
 import { forwardWithRetry } from './forwarder';
-import { logRequest, getRecentLogs, clearLogs, getStats, resetStats } from './logger';
+import { logRequest, getRecentLogs, clearLogs, getStats, resetStats, configureLogger } from './logger';
 import { initializeRateLimiters } from './rate-limiter';
 import { responseCache } from './cache';
 import { requestHedger } from './hedging';
 import { modelWarmer } from './warmup';
+import { requestQueue } from './request-queue';
 import type { AppConfig, ChatCompletionRequest, LogEntry } from './types';
 
 // ============================================================
@@ -355,6 +356,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         result = jsonResponse({ error: { message: err.message } }, 500);
       }
     }
+    else if (path === '/api/queue/stats' && method === 'GET') {
+      result = jsonResponse({
+        queues: requestQueue.getStats(),
+        overall: requestQueue.getOverallStats(),
+        config: requestQueue.getConfig(),
+      });
+    }
     else if (path === '/api/ping' && method === 'GET') {
       result = jsonResponse({
         status: 'ok',
@@ -634,6 +642,12 @@ async function main() {
     config = loadedConfig;
   }
 
+  // Configure logger buffer based on config (mobile optimized: smaller buffer = less memory)
+  configureLogger(config.maxLogEntries || 1000);
+  if ((config.maxLogEntries || 1000) <= 200) {
+    console.log(`[logger] Buffer size: ${config.maxLogEntries || 1000} entries (memory optimized)`);
+  }
+
   const validation = validateConfig(config);
   if (!validation.valid) {
     console.error('❌ Invalid configuration:');
@@ -644,7 +658,12 @@ async function main() {
   setProviders(config.providers);
   initializeKeyStates(config);
   initializeRateLimiters(config.providers);
-  startHealthCheckTimer();
+  // Use configured health check interval (default 5000ms, mobile optimized via config)
+  const healthInterval = config.healthCheckIntervalMs || 5000;
+  startHealthCheckTimer(healthInterval);
+  if (healthInterval > 10000) {
+    console.log(`[health] Check interval: ${healthInterval}ms (battery optimized)`);
+  }
 
   // Start model warmup with config from config.json
   const warmupConfig = (config as any).warmup || {};
@@ -657,8 +676,9 @@ async function main() {
   );
 
   const port = config.port || 8787;
-  const host = process.env.HOST || '127.0.0.1';
+  const host = config.host || process.env.HOST || '0.0.0.0';
   const server = createServer(handleRequest);
+  const isPublic = host === '0.0.0.0' || host === '::';
 
   server.listen(port, host, () => {
     console.log('');
@@ -667,6 +687,13 @@ async function main() {
     console.log('║                                                              ║');
     console.log(`║   Dashboard:  http://localhost:${port}                        ║`);
     console.log(`║   API:        http://localhost:${port}/v1                     ║`);
+    console.log('║                                                              ║');
+    if (isPublic) {
+      console.log(`║   🌐 Bound to all interfaces (0.0.0.0)                      ║`);
+      console.log(`║   Access from other devices via your phone's IP address     ║`);
+    } else {
+      console.log(`║   🔒 Bound to ${host} only                                 ║`);
+    }
     console.log('║                                                              ║');
     if (hasKeys) {
       const totalKeys = config.providers.reduce((sum, p) =>
@@ -680,6 +707,10 @@ async function main() {
     }
     console.log('║                                                              ║');
     console.log(`║   Test:  curl http://localhost:${port}/api/ping               ║`);
+    if (isPublic) {
+    console.log('║   ⚠ SECURITY: Bound to all network interfaces                ║');
+    console.log('║   Use HOST=127.0.0.1 to restrict to localhost only           ║');
+    }
     console.log('╚══════════════════════════════════════════════════════════════╝');
     console.log('');
   });

@@ -8,6 +8,8 @@ import { getKeyHash } from './key-pool';
 export interface RateLimitConfig {
   requestsPerWindow: number;
   windowMs: number;
+  maxConcurrent?: number; // Per-key concurrency limit (default: 4)
+  providerMaxConcurrent?: number; // Provider-wide concurrency limit (default: Infinity)
 }
 
 export interface ParsedRateLimitInfo {
@@ -23,11 +25,16 @@ export interface KeyRateLimitState {
   lastRefill: number;
   queuedRequests: Array<() => void>;
   isProcessing: boolean;
+  // Concurrency tracking
+  inFlight: number; // Currently in-flight requests
+  maxConcurrent: number; // Max allowed in-flight per key
 }
 
 export interface ProviderRateLimitState {
   keys: Map<string, KeyRateLimitState>;
   globalConfig: RateLimitConfig;
+  inFlight: number; // Total in-flight across all keys
+  providerMaxConcurrent: number; // Provider-wide max concurrent
 }
 
 /**
@@ -111,6 +118,8 @@ export class ProviderRateLimiter {
       this.states.set(providerId, {
         keys: new Map(),
         globalConfig: config,
+        inFlight: 0,
+        providerMaxConcurrent: config.providerMaxConcurrent ?? Infinity,
       });
     }
   }
@@ -131,6 +140,8 @@ export class ProviderRateLimiter {
         lastRefill: Date.now(),
         queuedRequests: [],
         isProcessing: false,
+        inFlight: 0,
+        maxConcurrent: config.maxConcurrent ?? 4,
       };
       providerState.keys.set(keyHash, keyState);
     }
@@ -143,14 +154,32 @@ export class ProviderRateLimiter {
    */
   async acquire(providerId: string, keyHash: string): Promise<void> {
     const config = this.configs.get(providerId);
-    if (!config) return; // No rate limit configured, allow
+    if (!config) return;
 
     const keyState = this.getKeyState(providerId, keyHash, config);
-    
+    const providerState = this.states.get(providerId);
     this.refillIfNeeded(config, keyState);
+
+    // Check provider-level concurrency first
+    if (providerState && providerState.inFlight >= providerState.providerMaxConcurrent) {
+      return new Promise<void>((resolve) => {
+        keyState.queuedRequests.push(resolve);
+        this.processQueue(providerId, keyHash, config);
+      });
+    }
+
+    // Then check per-key concurrency
+    if (keyState.inFlight >= keyState.maxConcurrent) {
+      return new Promise<void>((resolve) => {
+        keyState.queuedRequests.push(resolve);
+        this.processQueue(providerId, keyHash, config);
+      });
+    }
 
     if (keyState.tokens > 0) {
       keyState.tokens--;
+      keyState.inFlight++;
+      if (providerState) providerState.inFlight++;
       return;
     }
 
@@ -160,10 +189,22 @@ export class ProviderRateLimiter {
       this.processQueue(providerId, keyHash, config);
     });
   }
-
   /**
-   * Alias for acquire - more descriptive name for waiting for a rate limit slot
+   * Release a slot after request completes
    */
+  release(providerId: string, keyHash: string): void {
+    const config = this.configs.get(providerId);
+    if (!config) return;
+    const providerState = this.states.get(providerId);
+    if (!providerState) return;
+    const keyState = providerState.keys.get(keyHash);
+    if (keyState) {
+      if (keyState.inFlight > 0) keyState.inFlight--;
+      if (providerState.inFlight > 0) providerState.inFlight--;
+      this.processQueue(providerId, keyHash, config);
+    }
+  }
+
   async waitForSlot(providerId: string, keyHash?: string): Promise<void> {
     if (!keyHash) {
       // Fallback to global limiting if no key provided
@@ -184,6 +225,8 @@ export class ProviderRateLimiter {
       state = {
         keys: new Map(),
         globalConfig: config,
+        inFlight: 0,
+        providerMaxConcurrent: config.providerMaxConcurrent ?? Infinity,
       };
       this.states.set(providerId, state);
     }
@@ -194,7 +237,16 @@ export class ProviderRateLimiter {
     this.refillIfNeeded(config, keyState);
 
     if (keyState.tokens > 0) {
+
+    // Check provider-level concurrency
+    if (state && state.inFlight >= state.providerMaxConcurrent) {
+      return new Promise<void>((resolve) => {
+        keyState.queuedRequests.push(resolve);
+        this.processQueue(providerId, '__global__', config);
+      });
+    }
       keyState.tokens--;
+      state.inFlight++;
       return;
     }
 
@@ -282,8 +334,10 @@ export class ProviderRateLimiter {
 
     keyState.isProcessing = true;
 
-    while (keyState.tokens > 0 && keyState.queuedRequests.length > 0) {
+    while (keyState.tokens > 0 && keyState.inFlight < keyState.maxConcurrent && providerState.inFlight < providerState.providerMaxConcurrent && keyState.queuedRequests.length > 0) {
       keyState.tokens--;
+      keyState.inFlight++;
+      providerState.inFlight++;
       const resolve = keyState.queuedRequests.shift();
       if (resolve) resolve();
     }
@@ -352,6 +406,8 @@ export class ProviderRateLimiter {
       this.states.set(providerId, {
         keys: new Map(),
         globalConfig: config,
+        inFlight: 0,
+        providerMaxConcurrent: config.providerMaxConcurrent ?? Infinity,
       });
     }
   }
@@ -366,12 +422,12 @@ export const providerRateLimiter = new ProviderRateLimiter();
  * These are conservative defaults - actual limits from upstream headers will override
  */
 export const DEFAULT_PROVIDER_RATE_LIMITS: Record<string, RateLimitConfig> = {
-  openai: { requestsPerWindow: 500, windowMs: 60000 }, // 500 RPM per key
-  anthropic: { requestsPerWindow: 50, windowMs: 60000 }, // 50 RPM per key (conservative)
-  google: { requestsPerWindow: 60, windowMs: 60000 }, // 60 RPM per key
-  deepseek: { requestsPerWindow: 60, windowMs: 60000 }, // 60 RPM per key
-  nvidia: { requestsPerWindow: 32, windowMs: 60000 }, // 32 RPM per key (NVIDIA limit is 32)
-  perplexity: { requestsPerWindow: 50, windowMs: 60000 }, // 50 RPM per key
+  openai: { requestsPerWindow: 500, windowMs: 60000, maxConcurrent: 8, providerMaxConcurrent: 100 },
+  anthropic: { requestsPerWindow: 50, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 50 },
+  google: { requestsPerWindow: 60, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 60 },
+  deepseek: { requestsPerWindow: 60, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 60 },
+  nvidia: { requestsPerWindow: 32, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 32 },
+  perplexity: { requestsPerWindow: 50, windowMs: 60000, maxConcurrent: 4, providerMaxConcurrent: 50 },
 };
 
 /**

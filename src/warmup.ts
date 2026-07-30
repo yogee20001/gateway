@@ -389,6 +389,8 @@ export class ModelWarmer {
       state.warmupStats.failed++;
       state.warmupStats.lastError = error.message;
       console.warn(`[warmup] ${provider.id}/${model} error: ${error.message}`);
+    } finally {
+      providerRateLimiter.release(provider.id, keyHash);
     }
 
     state.warmupStats.totalWarmed++;

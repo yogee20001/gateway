@@ -63,6 +63,7 @@ export async function forwardNonStreaming(
   const keyHash = getKeyHash(keyResult.key);
   await providerRateLimiter.waitForSlot(provider.id, keyHash);
 
+  try {
   const url = buildUpstreamUrl(provider);
   const headers = buildUpstreamHeaders(provider, keyResult.key);
 
@@ -120,6 +121,9 @@ export async function forwardNonStreaming(
       headers: { 'Content-Type': 'application/json' },
     };
   }
+} finally {
+  providerRateLimiter.release(provider.id, keyHash);
+}
 }
 
 // ============================================================
@@ -145,6 +149,7 @@ export async function forwardStreaming(
   const keyHash = getKeyHash(keyResult.key);
   await providerRateLimiter.waitForSlot(provider.id, keyHash);
 
+  try {
   const url = buildUpstreamUrl(provider);
   const headers = buildUpstreamHeaders(provider, keyResult.key);
 
@@ -211,6 +216,9 @@ export async function forwardStreaming(
       headers: { 'Content-Type': 'application/json' },
     };
   }
+} finally {
+  providerRateLimiter.release(provider.id, keyHash);
+}
 }
 
 // ============================================================

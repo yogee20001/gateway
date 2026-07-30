@@ -238,7 +238,7 @@ export class ResponseCache {
  */
 export interface CacheableRequest {
   model: string;
-  messages: Array<{ role: string; content: string }>;
+  messages: Array<{ role: string; content: string | any }>;
   temperature?: number;
   max_tokens?: number;
   top_p?: number;

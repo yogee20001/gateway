@@ -8,6 +8,8 @@
 export interface RateLimitConfig {
   requestsPerWindow: number;
   windowMs: number;
+  maxConcurrent?: number;
+  providerMaxConcurrent?: number;
 }
 
 export interface Provider {
@@ -30,10 +32,14 @@ export interface Provider {
 // ============================================================
 export interface AppConfig {
   port?: number;
+  /** Host address to bind to (default: '0.0.0.0' for all interfaces, use '127.0.0.1' for localhost only) */
+  host?: string;
   logLevel?: LogLevel;
   maxLogEntries?: number;
   defaultMaxRetries?: number;
   defaultCooldownMs?: number;
+  /** Health check interval in milliseconds (default: 5000, mobile: 30000) */
+  healthCheckIntervalMs?: number;
   providers: Provider[];
 }
 

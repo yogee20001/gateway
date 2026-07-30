@@ -139,8 +139,17 @@ class StatsAccumulator {
 // ============================================================
 // Singleton Instances
 // ============================================================
-const logBuffer = new LogRingBuffer(1000);
+let logBuffer = new LogRingBuffer(1000);
 const stats = new StatsAccumulator();
+
+/**
+ * Configure the logger buffer size (call during startup with config.maxLogEntries)
+ * Reduces memory usage on mobile devices
+ */
+export function configureLogger(maxEntries: number = 1000): void {
+  const effectiveMax = Math.max(50, Math.min(maxEntries, 10000));
+  logBuffer = new LogRingBuffer(effectiveMax);
+}
 
 // ============================================================
 // Logging Functions

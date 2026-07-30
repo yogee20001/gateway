@@ -5,6 +5,7 @@
 import type { AppConfig, Provider, KeyState, KeyHealth, HealthResponse, ProviderHealth, KeyHealthEntry, HealthSummary } from './types';
 import { getProviderKeys, maskApiKey } from './config';
 import { createHash } from 'crypto';
+import { requestQueue } from './request-queue';
 
 // ============================================================
 // Module-Level State
@@ -190,6 +191,7 @@ export function markKeySuccess(providerId: string, keyIndex: number): void {
 
 export function checkAndRestoreKeys(): void {
   const now = Date.now();
+  const restoredProviders = new Set<string>();
 
   for (const [providerId, providerMap] of keyStates.entries()) {
     for (const [keyHash, state] of providerMap.entries()) {
@@ -199,7 +201,18 @@ export function checkAndRestoreKeys(): void {
         state.cooldownUntil = null;
         state.consecutiveErrors = 0;
         console.log(`[health] Key ${maskApiKey(state.key)} restored: ${oldHealth} → healthy`);
+        restoredProviders.add(providerId);
       }
+    }
+  }
+
+  // Drain queue for any provider that had keys restored
+  for (const providerId of restoredProviders) {
+    if (requestQueue.hasQueued(providerId)) {
+      console.log(`[health] Keys restored for ${providerId}, draining queue`);
+      requestQueue.drain(providerId).catch(err => {
+        console.error(`[health] Error draining queue for ${providerId}:`, err);
+      });
     }
   }
 }

@@ -75,10 +75,12 @@ export const DEFAULT_PROVIDERS: Provider[] = [
 export function createDefaultConfig(): AppConfig {
   return {
     port: 8787,
+    host: '0.0.0.0',
     logLevel: 'info',
     maxLogEntries: 1000,
     defaultMaxRetries: 3,
     defaultCooldownMs: 60000,
+    healthCheckIntervalMs: 5000,
     providers: DEFAULT_PROVIDERS.map(p => ({ ...p, apiKeys: [...(p.apiKeys || [])], rateLimit: null })),
   };
 }

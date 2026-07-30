@@ -197,6 +197,7 @@ export class RequestHedger {
 
     // Wait for rate limiter for this specific key
     await providerRateLimiter.waitForSlot(provider.id, keyHash);
+    try {
 
     const { buildUpstreamUrl, buildUpstreamHeaders } = await import('./forwarder');
     const { markKeySuccess, markKeyError } = await import('./key-pool');
@@ -242,6 +243,9 @@ export class RequestHedger {
       retries: 0,
       headers: Object.fromEntries(upstreamResponse.headers.entries()),
     };
+    } finally {
+      providerRateLimiter.release(provider.id, keyHash);
+    }
   }
 
   /**

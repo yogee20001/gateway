@@ -392,6 +392,7 @@ export class LatencyTester {
     
     const rateLimiterStart = Date.now();
     await providerRateLimiter.waitForSlot(provider.id, keyHash);
+    try {
     const rateLimiterEnd = Date.now();
     
     const requestStart = Date.now();
@@ -466,6 +467,9 @@ export class LatencyTester {
         retryLatencies: [],
       };
     }
+    } finally {
+      providerRateLimiter.release(provider.id, keyHash);
+    }
   }
   
   private async runConcurrentRequests(
@@ -501,8 +505,8 @@ export class LatencyTester {
     await Promise.all(promises);
   }
   
-  private generateMessages(count: number): Array<{ role: string; content: string }> {
-    const messages: Array<{ role: string; content: string }> = [];
+  private generateMessages(count: number): Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string }> {
+    const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string }> = [];
     for (let i = 0; i < count; i++) {
       messages.push({
         role: i % 2 === 0 ? 'user' : 'assistant',

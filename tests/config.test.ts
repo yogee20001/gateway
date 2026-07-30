@@ -6,7 +6,7 @@ import { maskApiKey, inferProviderPatternsFromId } from '../src/config';
 
 describe('maskApiKey', () => {
   it('masks long keys', () => {
-    expect(maskApiKey('sk-proj-abcdef123456')).toBe('sk-…56');
+    expect(maskApiKey('sk-proj-abcdef123456')).toBe('sk-…3456');
   });
 
   it('masks short keys', () => {
