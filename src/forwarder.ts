@@ -3,7 +3,7 @@
 // ============================================================
 
 import type { Provider, ChatCompletionRequest, AppConfig } from './types';
-import { selectBestApiKey, markKeyRateLimited, markKeyError, markKeySuccess } from './key-pool';
+import\ \{\ selectBestApiKey,\ markKeyRateLimited,\ markKeyError,\ markKeySuccess\ }\ from\ '\./key-pool';
 import { calculateBackoff, isRetryableStatus, isRateLimitStatus, isServerErrorStatus } from './retry';
 import { providerRateLimiter, parseRateLimitHeaders, type ParsedRateLimitInfo } from './rate-limiter';
 
@@ -97,9 +97,23 @@ export async function forwardNonStreaming(
       responseBody = { error: { message: 'Failed to read upstream response' } };
     }
 
-    if (status >= 200 && status < 300) {
-      markKeySuccess(provider.id, keyResult.index);
-    }
+ if (status >= 200 && status < 300) {
+        // Check for provider-specific errors embedded in 200 responses (e.g. NVIDIA ResourceExhausted)
+        const isResourceExhausted = responseBody?.error?.code === 'ResourceExhausted'
+          || (typeof responseBody?.error?.message === 'string' && responseBody.error.message.includes('ResourceExhausted'))
+          || (typeof responseBody?.error?.message === 'string' && responseBody.error.message.includes('Worker local total request limit reached'));
+        if (isResourceExhausted) {
+          console.log('[forwarder] Provider returned ResourceExhausted in 200 response for ' + provider.id + ' key ' + keyResult.index + ' — treating as 429');
+          markKeyRateLimited(provider.id, keyResult.index, 60000);
+          return {
+            status: 429,
+            body: responseBody,
+            keyIndex: keyResult.index,
+            headers: Object.fromEntries(upstreamResponse.headers.entries()),
+          };
+        }
+        markKeySuccess(provider.id, keyResult.index);
+      }
 
     return {
       status,

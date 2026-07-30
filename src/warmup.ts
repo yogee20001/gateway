@@ -333,12 +333,15 @@ export class ModelWarmer {
     const keys = getProviderKeys(provider);
     if (keys.length === 0) return;
 
-    // Use first available key
-    const key = keys[0];
+    const { selectBestApiKey } = await import('./key-pool');
+    const keyResult = selectBestApiKey(provider);
+    if (!keyResult) return;
+    const key = keyResult.key;
+    const keyIndex = keyResult.index;
     const keyHash = getKeyHash(key);
 
     const { buildUpstreamUrl, buildUpstreamHeaders } = await import('./forwarder');
-    const { providerRateLimiter } = await import('./rate-limiter');
+    const { providerRateLimiter, parseRateLimitHeaders } = await import('./rate-limiter');
     const { markKeySuccess, markKeyError } = await import('./key-pool');
 
     const url = buildUpstreamUrl(provider);
@@ -370,7 +373,7 @@ export class ModelWarmer {
       const latency = Date.now() - startTime;
 
       if (response.ok) {
-        markKeySuccess(provider.id, 0);
+        markKeySuccess(provider.id, keyIndex);
         state.warmupStats.successful++;
         state.warmupStats.lastSuccessAt = Date.now();
         state.warmupStats.averageLatencyMs = 
@@ -379,7 +382,12 @@ export class ModelWarmer {
         const label = isPriority ? 'priority' : 'regular';
         console.log(`[warmup] ${provider.id}/${model} ${label} warmed in ${latency}ms`);
       } else {
-        markKeyError(provider.id, 0, `HTTP ${response.status}`);
+        // Update rate limiter with upstream headers so tokens stay in sync
+        const rateLimitInfo = parseRateLimitHeaders(response.headers);
+        if (rateLimitInfo.limit || rateLimitInfo.remaining !== undefined || rateLimitInfo.resetMs || rateLimitInfo.retryAfterMs) {
+          providerRateLimiter.updateFromHeaders(provider.id, keyHash, response.headers);
+        }
+        markKeyError(provider.id, keyIndex, `HTTP ${response.status}`);
         state.warmupStats.failed++;
         state.warmupStats.lastError = `HTTP ${response.status}`;
         console.warn(`[warmup] ${provider.id}/${model} failed: ${response.status}`);
