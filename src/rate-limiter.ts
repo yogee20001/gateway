@@ -201,17 +201,39 @@ export class ProviderRateLimiter {
       this.refillProviderIfNeeded(providerState);
       if (providerState.providerTokens <= 0) {
         return new Promise<void>((resolve) => {
-          providerState.providerQueue.push(resolve);
+          providerState.providerQueue.push(() => {
+            const keyState = this.getKeyState(providerId, keyHash, config);
+            if (keyState.inFlight < keyState.maxConcurrent && keyState.tokens > 0) {
+              keyState.tokens--;
+              keyState.inFlight++;
+              providerState.inFlight++;
+              resolve();
+            } else {
+              // Return the provider token consumed by processProviderQueue; it
+              // will be consumed again when processQueue admits this request.
+              providerState.providerTokens = Math.min(
+                providerState.providerRequestsPerWindow,
+                providerState.providerTokens + 1
+              );
+              keyState.queuedRequests.push(resolve);
+              this.processQueue(providerId, keyHash, config);
+            }
+          });
           this.processProviderQueue(providerId);
         });
       }
-      providerState.providerTokens--;
     }
 
     if (keyState.tokens > 0) {
       keyState.tokens--;
       keyState.inFlight++;
-      if (providerState) providerState.inFlight++;
+      if (providerState) {
+        // Only consume a provider token when the key token check succeeds
+        if (providerState.providerRequestsPerWindow > 0) {
+          providerState.providerTokens--;
+        }
+        providerState.inFlight++;
+      }
       return;
     }
 
@@ -291,15 +313,35 @@ export class ProviderRateLimiter {
       this.refillProviderIfNeeded(state);
       if (state.providerTokens <= 0) {
         return new Promise<void>((resolve) => {
-          state.providerQueue.push(resolve);
+          state.providerQueue.push(() => {
+            const keyState = this.getKeyState(providerId, '__global__', config);
+            if (keyState.inFlight < keyState.maxConcurrent && keyState.tokens > 0) {
+              keyState.tokens--;
+              keyState.inFlight++;
+              state.inFlight++;
+              resolve();
+            } else {
+              // Return the provider token consumed by processProviderQueue; it
+              // will be consumed again when processQueue admits this request.
+              state.providerTokens = Math.min(
+                state.providerRequestsPerWindow,
+                state.providerTokens + 1
+              );
+              keyState.queuedRequests.push(resolve);
+              this.processQueue(providerId, '__global__', config);
+            }
+          });
           this.processProviderQueue(providerId);
         });
       }
-      state.providerTokens--;
     }
 
     if (keyState.tokens > 0) {
       keyState.tokens--;
+      keyState.inFlight++;
+      if (state && state.providerRequestsPerWindow > 0) {
+        state.providerTokens--;
+      }
       state.inFlight++;
       return;
     }
@@ -402,6 +444,15 @@ export class ProviderRateLimiter {
     keyState.isProcessing = true;
 
     while (keyState.tokens > 0 && keyState.inFlight < keyState.maxConcurrent && providerState.inFlight < providerState.providerMaxConcurrent && keyState.queuedRequests.length > 0) {
+      // Queued requests must also respect the provider-level shared bucket
+      if (providerState.providerRequestsPerWindow > 0) {
+        this.refillProviderIfNeeded(providerState);
+        if (providerState.providerTokens <= 0) {
+          // No provider capacity - leave the waiter queued until a refill
+          break;
+        }
+        providerState.providerTokens--;
+      }
       keyState.tokens--;
       keyState.inFlight++;
       providerState.inFlight++;
@@ -421,6 +472,17 @@ export class ProviderRateLimiter {
         }, delay);
       }
     }
+
+    // If the queue is blocked on the provider bucket, schedule a provider refill
+    if (keyState.queuedRequests.length > 0 && providerState.providerRequestsPerWindow > 0 && providerState.providerTokens <= 0) {
+      const nextRefill = providerState.providerLastRefill + providerState.providerWindowMs;
+      const delay = Math.max(0, nextRefill - Date.now());
+      if (delay > 10) {
+        setTimeout(() => {
+          this.processQueue(providerId, keyHash, config);
+        }, delay);
+      }
+    }
   }
 
   private processProviderQueue(providerId: string): void {
@@ -433,8 +495,8 @@ export class ProviderRateLimiter {
 
     while (providerState.providerTokens > 0 && providerState.providerQueue.length > 0) {
       providerState.providerTokens--;
-      const resolve = providerState.providerQueue.shift();
-      if (resolve) resolve();
+      const entry = providerState.providerQueue.shift();
+      if (entry) entry();
     }
 
     providerState.providerQueueProcessing = false;

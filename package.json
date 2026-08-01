@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "npx tsx watch src/index.ts",
     "start": "npx tsx src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.mjs",
+    "start:prod": "node dist/index.mjs",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --minify --target=node20 --outfile=dist/index.mjs && node scripts/copy-dashboard.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

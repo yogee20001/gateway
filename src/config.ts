@@ -78,9 +78,14 @@ export function createDefaultConfig(): AppConfig {
     host: '0.0.0.0',
     logLevel: 'info',
     maxLogEntries: 1000,
-    defaultMaxRetries: 3,
+    defaultMaxRetries: 1,
     defaultCooldownMs: 60000,
-    healthCheckIntervalMs: 5000,
+    healthCheckIntervalMs: 60000,
+    maxConcurrentRequests: 50,
+    maxQueuedRequests: 100,
+    queueTimeoutMs: 30000,
+    maxBodyBytes: 10485760,
+    hedging: { enabled: false },
     providers: DEFAULT_PROVIDERS.map(p => ({ ...p, apiKeys: [...(p.apiKeys || [])], rateLimit: null })),
   };
 }
@@ -132,6 +137,22 @@ export function validateConfig(config: AppConfig): ValidationResult {
   }
 
   const seenIds = new Set<string>();
+
+  // Validate optional performance fields (positive numbers when present)
+  const perfFields: Array<[string, unknown]> = [
+    ['maxConcurrentRequests', config.maxConcurrentRequests],
+    ['maxQueuedRequests', config.maxQueuedRequests],
+    ['queueTimeoutMs', config.queueTimeoutMs],
+    ['maxBodyBytes', config.maxBodyBytes],
+    ['healthCheckIntervalMs', config.healthCheckIntervalMs],
+    ['defaultMaxRetries', config.defaultMaxRetries],
+    ['defaultCooldownMs', config.defaultCooldownMs],
+  ];
+  for (const [field, value] of perfFields) {
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+      errors.push(`config.${field} must be a positive number`);
+    }
+  }
 
   for (let i = 0; i < config.providers.length; i++) {
     const p = config.providers[i];

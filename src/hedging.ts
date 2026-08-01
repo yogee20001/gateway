@@ -5,8 +5,9 @@
 
 import type { Provider, ChatCompletionRequest, AppConfig } from './types';
 import { getProviderKeys } from './config';
-import { getKeyHash } from './key-pool';
-import { providerRateLimiter } from './rate-limiter';
+import { getKeyHash, selectBestApiKey, getKeyHealthSummary, markKeySuccess, markKeyError } from './key-pool';
+import { providerRateLimiter, parseRateLimitHeaders } from './rate-limiter';
+import { buildUpstreamUrl, buildUpstreamHeaders, forwardWithRetry } from './forwarder';
 
 export interface HedgingConfig {
   enabled: boolean;
@@ -19,7 +20,7 @@ export interface HedgingConfig {
 }
 
 const DEFAULT_HEDGING_CONFIG: Required<HedgingConfig> = {
-  enabled: true,
+  enabled: false,
   maxHedgedRequests: 2,
   hedgeDelayMs: 500,
   cancelOnFirstSuccess: true,
@@ -34,6 +35,7 @@ export interface HedgedResponse {
   keyIndex: number;
   retries: number;
   headers: Record<string, string>;
+  streamResponse: Response | null;
 }
 
 export interface HedgeInfo {
@@ -61,12 +63,13 @@ export class RequestHedger {
   async executeWithHedging(
     provider: Provider,
     request: ChatCompletionRequest,
-    config: AppConfig
+    config: AppConfig,
+    rawBody?: string
   ): Promise<HedgingResult> {
     // Check if hedging should be applied
     if (!this.shouldHedge(request)) {
       // Fall back to normal single-key execution
-      const { forwardWithRetry } = await import('./forwarder');
+      // Note: forwardWithRetry already carries streamResponse (raw SSE Response)
       const result = await forwardWithRetry(provider, request, config);
       return {
         response: result,
@@ -77,7 +80,6 @@ export class RequestHedger {
     const keys = getProviderKeys(provider);
     if (keys.length < 2) {
       // Not enough keys for hedging
-      const { forwardWithRetry } = await import('./forwarder');
       const result = await forwardWithRetry(provider, request, config);
       return {
         response: result,
@@ -88,58 +90,108 @@ export class RequestHedger {
     const maxAttempts = Math.min(this.config.maxHedgedRequests, keys.length);
     const startTime = Date.now();
     const abortController = new AbortController();
-    
+
     // Track which keys we've attempted
     const attemptedKeys = new Set<number>();
-    const results: Promise<HedgedResponse>[] = [];
-    
+
+    // First-success race bookkeeping:
+    // - expectedCount: primary + every scheduled hedge timer
+    // - settledCount:  attempts that have completed (or were skipped after abort)
+    // - sentCount:     requests actually dispatched upstream
+    // A 2xx resolves the race immediately; if every attempt settles without a
+    // success, the failure path rejects with the last error.
+    let expectedCount = 0;
+    let settledCount = 0;
+    let sentCount = 0;
+    let hasSuccess = false;
+
+    let resolveFirstSuccess!: (response: HedgedResponse) => void;
+    let rejectAllFailed!: (error: unknown) => void;
+    const firstSuccessPromise = new Promise<HedgedResponse>((resolve, reject) => {
+      resolveFirstSuccess = resolve;
+      rejectAllFailed = reject;
+    });
+
+    const onSettled = (): void => {
+      settledCount++;
+      if (!hasSuccess && settledCount >= expectedCount) {
+        rejectAllFailed(new Error('All hedged requests failed'));
+      }
+    };
+
+    const handleResult = (result: HedgedResponse): void => {
+      settledCount++;
+      if (hasSuccess) return;
+      if (result.status >= 200 && result.status < 300) {
+        hasSuccess = true;
+        if (this.config.cancelOnFirstSuccess) {
+          abortController.abort('First request succeeded');
+        }
+        resolveFirstSuccess(result);
+      } else if (settledCount >= expectedCount) {
+        // Every attempt settled without success - surface the last failure
+        rejectAllFailed(new Error(`HTTP ${result.status}`));
+      }
+    };
+
+    const handleError = (error: unknown): void => {
+      settledCount++;
+      if (!hasSuccess && settledCount >= expectedCount) {
+        rejectAllFailed(error);
+      }
+    };
+
     // Send first request immediately
     const firstKeyIndex = await this.selectBestKey(provider);
-    attemptedKeys.add(firstKeyIndex);
-    results.push(this.executeSingleRequest(
-      provider, request, config, firstKeyIndex, abortController.signal
-    ));
+    if (firstKeyIndex === -1) {
+      const result = await forwardWithRetry(provider, request, config);
+      return {
+        response: result,
+        hedgeInfo: { hedged: false, attempts: 1, firstSuccessAt: 0, cancelled: 0 },
+      };
+    }
 
-    // Schedule hedged requests
-    const hedgePromises: Promise<void>[] = [];
+    attemptedKeys.add(firstKeyIndex);
+    expectedCount++;
+    sentCount++;
+    this.executeSingleRequest(provider, request, config, firstKeyIndex, abortController.signal, rawBody)
+      .then(handleResult, handleError);
+
+    // Schedule hedged requests. The delay timers are NOT awaited - the first
+    // success resolves immediately and aborts any pending hedges.
     for (let i = 1; i < maxAttempts; i++) {
       const keyIndex = await this.selectBestKey(provider, attemptedKeys);
       if (keyIndex === -1) break;
-      
+
       attemptedKeys.add(keyIndex);
-      
+      expectedCount++;
+
       // Delay before sending hedged request
       const delay = this.config.hedgeDelayMs * i;
-      hedgePromises.push(
-        new Promise<void>(resolve => setTimeout(resolve, delay)).then(() => {
-          if (!abortController.signal.aborted) {
-            results.push(this.executeSingleRequest(
-              provider, request, config, keyIndex, abortController.signal
-            ));
-          }
-        })
-      );
+      setTimeout(() => {
+        if (abortController.signal.aborted) {
+          // Cancelled before this hedge fired - count it as settled
+          onSettled();
+          return;
+        }
+        sentCount++;
+        this.executeSingleRequest(provider, request, config, keyIndex, abortController.signal, rawBody)
+          .then(handleResult, handleError);
+      }, delay);
     }
 
-    // Wait for all hedge delays to be scheduled
-    await Promise.all(hedgePromises);
-
-    // Race all requests - return first success
+    // Wait for the first success - resolves the moment a 2xx arrives
     try {
-      const firstSuccess = await this.waitForFirstSuccess(results, abortController);
-      
+      const firstSuccess = await firstSuccessPromise;
+
       const firstSuccessAt = Date.now() - startTime;
-      const cancelled = results.length - 1;
-      
-      if (this.config.cancelOnFirstSuccess) {
-        abortController.abort('First request succeeded');
-      }
+      const cancelled = sentCount - 1;
 
       return {
         response: firstSuccess,
         hedgeInfo: {
           hedged: true,
-          attempts: results.length,
+          attempts: sentCount,
           firstSuccessAt,
           cancelled,
         },
@@ -151,37 +203,6 @@ export class RequestHedger {
   }
 
   /**
-   * Wait for first successful response from any request
-   */
-  private async waitForFirstSuccess(
-    promises: Promise<HedgedResponse>[],
-    abortSignal: AbortSignal
-  ): Promise<HedgedResponse> {
-    // Create a promise that resolves on first success
-    const racePromise = Promise.race(
-      promises.map(p => p.then(
-        result => {
-          if (result.status >= 200 && result.status < 300) {
-            return result;
-          }
-          // Treat non-success as rejection for racing
-          throw new Error(`HTTP ${result.status}`);
-        },
-        err => { throw err; }
-      ))
-    );
-
-    try {
-      return await racePromise;
-    } catch {
-      // All failed - wait for all to complete to get the last error
-      const allResults = await Promise.allSettled(promises);
-      const lastError = allResults.find(r => r.status === 'rejected')?.reason;
-      throw lastError || new Error('All hedged requests failed');
-    }
-  }
-
-  /**
    * Execute a single request with a specific key
    */
   private async executeSingleRequest(
@@ -189,27 +210,29 @@ export class RequestHedger {
     request: ChatCompletionRequest,
     config: AppConfig,
     keyIndex: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    rawBody?: string
   ): Promise<HedgedResponse> {
-    const keys = getProviderKeys(provider);
-    const key = keys[keyIndex];
-    const keyHash = getKeyHash(key);
+  const keys = getProviderKeys(provider);
+  const key = keys[keyIndex];
+  const keyHash = getKeyHash(key);
 
-    // Wait for rate limiter for this specific key
-    await providerRateLimiter.waitForSlot(provider.id, keyHash);
-    try {
+  // Check if already cancelled before consuming rate limiter slot
+  if (signal.aborted) {
+    throw new Error('Request cancelled before execution');
+  }
 
-    const { buildUpstreamUrl, buildUpstreamHeaders } = await import('./forwarder');
-    const { markKeySuccess, markKeyError } = await import('./key-pool');
-    const { parseRateLimitHeaders } = await import('./rate-limiter');
+  // Wait for rate limiter for this specific key
+  await providerRateLimiter.waitForSlot(provider.id, keyHash);
+  try {
 
-    const url = buildUpstreamUrl(provider);
+  const url = buildUpstreamUrl(provider);
     const headers = buildUpstreamHeaders(provider, key);
 
     const upstreamResponse = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify(request),
+      body: rawBody ?? JSON.stringify(request),
       signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
     });
 
@@ -230,20 +253,21 @@ export class RequestHedger {
       responseBody = { error: { message: 'Failed to read response' } };
     }
 
-    if (status >= 200 && status < 300) {
-      markKeySuccess(provider.id, keyIndex);
-    } else {
-      markKeyError(provider.id, keyIndex, `HTTP ${status}`);
-    }
+  if (status >= 200 && status < 300) {
+    markKeySuccess(provider.id, keyIndex);
+  } else {
+    markKeyError(provider.id, keyIndex, `HTTP ${status}`);
+  }
 
-    return {
-      status,
-      body: responseBody,
-      keyIndex,
-      retries: 0,
-      headers: Object.fromEntries(upstreamResponse.headers.entries()),
-    };
-    } finally {
+  return {
+    status,
+    body: responseBody,
+    keyIndex,
+    retries: 0,
+    headers: Object.fromEntries(upstreamResponse.headers.entries()),
+    streamResponse: null,
+  };
+} finally {
       providerRateLimiter.release(provider.id, keyHash);
     }
   }
@@ -251,9 +275,8 @@ export class RequestHedger {
   /**
    * Select the best available key (least used, healthy)
    */
-  private async selectBestKey(provider: Provider, exclude: Set<number> = new Set()): Promise<number> {
-    const { selectBestApiKey, getKeyHealthSummary } = await import('./key-pool');
-    const keyResult = selectBestApiKey(provider);
+private async selectBestKey(provider: Provider, exclude: Set<number> = new Set()): Promise<number> {
+  const keyResult = selectBestApiKey(provider);
     if (!keyResult) return -1;
     
     // If excluded, try to find another
@@ -306,7 +329,7 @@ export class RequestHedger {
  * Global hedger instance
  */
 export const requestHedger = new RequestHedger({
-  enabled: true,
+  enabled: false,
   maxHedgedRequests: 2,
   hedgeDelayMs: 500,
   cancelOnFirstSuccess: true,

@@ -12,6 +12,23 @@ export interface RateLimitConfig {
   providerMaxConcurrent?: number;
 }
 
+export interface QueueConfig {
+  enabled: boolean;
+  maxSize: number;
+  defaultTimeoutMs: number;
+}
+
+/** Hedging settings (mirrors src/hedging.ts HedgingConfig, kept here to avoid circular imports) */
+export interface HedgingSettings {
+  enabled?: boolean;
+  maxHedgedRequests?: number;
+  hedgeDelayMs?: number;
+  cancelOnFirstSuccess?: boolean;
+  excludeStreaming?: boolean;
+  excludeHighTemperature?: boolean;
+  temperatureThreshold?: number;
+}
+
 export interface Provider {
   id: string;
   name: string;
@@ -38,8 +55,18 @@ export interface AppConfig {
   maxLogEntries?: number;
   defaultMaxRetries?: number;
   defaultCooldownMs?: number;
-  /** Health check interval in milliseconds (default: 5000, mobile: 30000) */
+  /** Health check interval in milliseconds (default: 60000, mobile: 30000) */
   healthCheckIntervalMs?: number;
+  /** Global max concurrent in-flight requests (default: 50) */
+  maxConcurrentRequests?: number;
+  /** Global max queued requests while at the concurrency limit (default: 100) */
+  maxQueuedRequests?: number;
+  /** Timeout for requests waiting in the global queue, ms (default: 30000) */
+  queueTimeoutMs?: number;
+  /** Max request body size in bytes for /v1/chat/completions (default: 10 MB) */
+  maxBodyBytes?: number;
+  /** Hedging behavior (default: disabled) */
+  hedging?: HedgingSettings;
   providers: Provider[];
 }
 
@@ -223,6 +250,15 @@ export interface ErrorResponse {
     param?: string | null;
     details?: Record<string, unknown>;
   };
+}
+
+export interface ForwardResult {
+  status: number;
+  body: any;
+  keyIndex: number;
+  retries: number;
+  headers: Record<string, string>;
+  streamResponse: Response | null;
 }
 
 // ============================================================

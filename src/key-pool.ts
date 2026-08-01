@@ -12,6 +12,8 @@ import { requestQueue } from './request-queue';
 // ============================================================
 const keyStates: Map<string, Map<string, KeyState>> = new Map();
 const roundRobinIndices: Map<string, number> = new Map();
+const sortedKeyIndicesMap: Map<string, number[]> = new Map();
+const providerCache: Map<string, Provider> = new Map();
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 
 // ============================================================
@@ -48,9 +50,13 @@ export function initializeKeyStates(config: AppConfig): void {
       });
     }
 
-    keyStates.set(provider.id, providerMap);
-    roundRobinIndices.set(provider.id, -1);
-  }
+  keyStates.set(provider.id, providerMap);
+  roundRobinIndices.set(provider.id, -1);
+
+  const providerKeys = getProviderKeys(provider);
+  const sortedIndices = providerKeys.map((_, i) => i).sort((a, b) => a - b);
+  sortedKeyIndicesMap.set(provider.id, sortedIndices);
+}
 }
 
 // ============================================================
@@ -63,9 +69,20 @@ export function selectBestApiKey(provider: Provider): { key: string; index: numb
   const keys = getProviderKeys(provider);
   const healthyKeys: Array<{ key: string; index: number; state: KeyState }> = [];
 
+  // Reuse the keyHash already stored in each key state entry instead of
+  // recomputing sha256 per key on every selection call. Build a raw-key →
+  // state lookup once from the existing provider state map.
+  const stateByKey = new Map<string, KeyState>();
+  for (const state of providerMap.values()) {
+    stateByKey.set(state.key, state);
+  }
+
   for (let i = 0; i < keys.length; i++) {
-    const keyHash = getKeyHash(keys[i]);
-    const state = providerMap.get(keyHash);
+    let state = stateByKey.get(keys[i]);
+    if (!state) {
+      // Fallback for keys not yet present in provider states (e.g. freshly added)
+      state = providerMap.get(getKeyHash(keys[i]));
+    }
     if (!state) continue;
 
     if (state.health === 'healthy') {
@@ -79,15 +96,24 @@ export function selectBestApiKey(provider: Provider): { key: string; index: numb
   let selected: { key: string; index: number; state: KeyState } = healthyKeys[0];
 
   switch (strategy) {
-    case 'round-robin': {
-      let lastIdx = roundRobinIndices.get(provider.id) ?? -1;
-      // Find the next healthy key after lastIdx
-      const sorted = healthyKeys.sort((a, b) => a.index - b.index);
-      const next = sorted.find(k => k.index > lastIdx) || sorted[0];
-      selected = next;
-      roundRobinIndices.set(provider.id, next.index);
-      break;
+case 'round-robin': {
+  const sorted = sortedKeyIndicesMap.get(provider.id) || [];
+  const healthySet = new Set(healthyKeys.map(h => h.index));
+  const healthySorted = sorted.filter(i => healthySet.has(i));
+  if (healthySorted.length === 0) {
+    selected = healthyKeys[0];
+  } else {
+    let lastIdx = roundRobinIndices.get(provider.id) ?? -1;
+    const nextIdx = healthySorted.find(i => i > lastIdx);
+    const selectedIdx = nextIdx !== undefined ? nextIdx : healthySorted[0];
+    const selectedKey = healthyKeys.find(h => h.index === selectedIdx);
+    if (selectedKey) {
+      selected = selectedKey;
+      roundRobinIndices.set(provider.id, selectedIdx);
     }
+  }
+  break;
+}
     case 'least-used': {
       selected = healthyKeys.reduce((a, b) =>
         a.state.usageCount <= b.state.usageCount ? a : b
@@ -297,8 +323,10 @@ let _providers: Provider[] = [];
 
 export function setProviders(providers: Provider[]): void {
   _providers = providers;
+  providerCache.clear();
+  providers.forEach(p => providerCache.set(p.id, p));
 }
 
 function findProviderById(id: string): Provider | undefined {
-  return _providers.find(p => p.id === id);
+  return providerCache.get(id);
 }

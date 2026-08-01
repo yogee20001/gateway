@@ -11,33 +11,51 @@ import { loadConfig, saveConfig, validateConfig, createDefaultConfig, maskApiKey
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { findProvidersForModel } from './router';
+import { findProvidersForModel, invalidateModelCache } from './router';
 import { initializeKeyStates, startHealthCheckTimer, stopHealthCheckTimer, getKeyHealthSummary, setProviders } from './key-pool';
 import { forwardWithRetry } from './forwarder';
 import { logRequest, getRecentLogs, clearLogs, getStats, resetStats, configureLogger } from './logger';
-import { initializeRateLimiters } from './rate-limiter';
+import { initializeRateLimiters, providerRateLimiter } from './rate-limiter';
 import { responseCache } from './cache';
 import { requestHedger } from './hedging';
 import { modelWarmer } from './warmup';
 import { requestQueue } from './request-queue';
+import { acquireGlobalSlot, releaseGlobalSlot, configureGlobalGuard } from './concurrency-guard';
 import type { AppConfig, ChatCompletionRequest, LogEntry } from './types';
 
 // ============================================================
 // State
 // ============================================================
 let config: AppConfig;
+let dashboardCache: { html: string; appJs: string; stylesCss: string } | null = null;
+
+// ============================================================
+// Debug Logging Helper
+// ============================================================
+function isDebug(): boolean {
+  return config?.logLevel === 'debug';
+}
 
 // ============================================================
 // Request Body Parsing
 // ============================================================
-function parseBody(req: IncomingMessage): Promise<any> {
+function parseBody(req: IncomingMessage, maxBytes?: number): Promise<{ parsed: any; raw: string }> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let totalBytes = 0;
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+    });
     req.on('end', () => {
       try {
+        if (maxBytes !== undefined && totalBytes > maxBytes) {
+          req.destroy();
+          reject(Object.assign(new Error('Request body exceeds limit'), { code: 'BODY_TOO_LARGE' }));
+          return;
+        }
         const body = Buffer.concat(chunks).toString('utf-8');
-        resolve(body ? JSON.parse(body) : {});
+        resolve({ parsed: body ? JSON.parse(body) : {}, raw: body });
       } catch (err) {
         reject(err);
       }
@@ -94,6 +112,26 @@ function corsPreflightResponse(): { status: number; data: string; headers: Recor
 }
 
 // ============================================================
+// Dashboard Cache
+// ============================================================
+function loadDashboardCache(): void {
+  const dashboardDir = join(__dirname, 'dashboard');
+  try {
+    dashboardCache = {
+      html: readFileSync(join(dashboardDir, 'index.html'), 'utf-8'),
+      appJs: readFileSync(join(dashboardDir, 'app.js'), 'utf-8'),
+      stylesCss: readFileSync(join(dashboardDir, 'styles.css'), 'utf-8'),
+    };
+  } catch (err) {
+    // Dashboard assets missing (e.g. running the bundled dist build without
+    // copying src/dashboard). Cache stays null; serveDashboard/serveStatic
+    // already degrade gracefully to disk reads / 404s.
+    dashboardCache = null;
+    console.warn(`[dashboard] Cache load skipped (dashboard assets not found): ${(err as Error).message}`);
+  }
+}
+
+// ============================================================
 // Serve Dashboard
 // ============================================================
 function serveDashboard(): { status: number; data: string; headers: Record<string, string> } {
@@ -101,7 +139,7 @@ function serveDashboard(): { status: number; data: string; headers: Record<strin
   if (!existsSync(dashboardPath)) {
     return htmlResponse('<h1>Dashboard not found</h1><p>Run the gateway from the project root directory.</p>', 404);
   }
-  const html = readFileSync(dashboardPath, 'utf-8');
+  const html = dashboardCache?.html || readFileSync(dashboardPath, 'utf-8');
   return htmlResponse(html);
 }
 
@@ -124,7 +162,21 @@ function serveStatic(urlPath: string): { status: number; data: any; headers: Rec
     '.svg': 'image/svg+xml',
   };
 
-  const content = readFileSync(filePath);
+  let content: Buffer | string;
+  if (dashboardCache) {
+    const fileName = urlPath.replace('/dashboard/', '');
+    if (fileName === 'app.js') {
+      content = dashboardCache.appJs;
+    } else if (fileName === 'styles.css') {
+      content = dashboardCache.stylesCss;
+    } else if (fileName === 'index.html') {
+      content = dashboardCache.html;
+    } else {
+      content = readFileSync(filePath);
+    }
+  } else {
+    content = readFileSync(filePath);
+  }
   return {
     status: 200,
     data: content,
@@ -177,7 +229,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
     else if (path === '/api/config' && method === 'PUT') {
       try {
-        const newConfig = await parseBody(req) as AppConfig;
+        const { parsed: newConfig } = await parseBody(req);
 
         // Merge incoming config with existing config to preserve masked keys
         // If a provider ID matches an existing provider, keep only the keys that are
@@ -255,6 +307,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           saveConfig(config);
           setProviders(config.providers);
           initializeKeyStates(config);
+          invalidateModelCache();
+          configureGlobalGuard({
+            maxConcurrent: config.maxConcurrentRequests,
+            maxQueued: config.maxQueuedRequests,
+            queueTimeoutMs: config.queueTimeoutMs,
+          });
+          requestHedger.updateConfig(config.hedging || { enabled: false });
           result = jsonResponse({ success: true, message: 'Configuration saved' });
         }
       } catch (err) {
@@ -265,7 +324,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const healthSummary = getKeyHealthSummary();
       // Add rate limit status to health response
       const rateLimitStatus: Record<string, any> = {};
-      const { providerRateLimiter } = await import('./rate-limiter');
       for (const providerId of Object.keys(healthSummary.providers)) {
         const status = providerRateLimiter.getStatus(providerId);
         if (status) {
@@ -326,7 +384,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
     else if (path === '/api/warmup/config' && method === 'PUT') {
       try {
-        const newConfig = await parseBody(req);
+        const { parsed: newConfig } = await parseBody(req);
         modelWarmer.updateConfig(newConfig);
         result = jsonResponse({ success: true, message: 'Warmup configuration updated' });
       } catch (err: any) {
@@ -341,7 +399,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
     else if (path === '/api/warmup/force' && method === 'POST') {
       try {
-        const body = await parseBody(req) as { providerId: string; model: string; priority?: boolean };
+        const { parsed: body } = await parseBody(req);
         const provider = config.providers.find(p => p.id === body.providerId);
         if (!provider) {
           result = jsonResponse({ error: { message: `Provider '${body.providerId}' not found` } }, 404);
@@ -374,7 +432,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
     else if (path === '/api/test' && method === 'POST') {
       try {
-        const body = await parseBody(req);
+        const { parsed: body, raw } = await parseBody(req);
         const model = body.model || 'test-model';
         const matches = findProvidersForModel(model, config);
 
@@ -440,12 +498,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
     else if (path === '/v1/chat/completions' && method === 'POST') {
       try {
-        const body = await parseBody(req) as ChatCompletionRequest;
+        const { parsed, raw: rawBody } = await parseBody(req, config.maxBodyBytes);
+        const body = parsed as ChatCompletionRequest;
 
         if (!body.model || !body.messages) {
           result = jsonResponse({ error: { message: 'Invalid request: model and messages are required', code: 'invalid_request' } }, 400);
         } else {
-          console.log(`[request] POST /v1/chat/completions model=${body.model} messages=${body.messages.length} stream=${body.stream}`);
+          if (isDebug()) {
+            console.log(`[request] POST /v1/chat/completions model=${body.model} messages=${body.messages.length} stream=${body.stream}`);
+          }
 
           const matches = findProvidersForModel(body.model, config);
           if (matches.length === 0) {
@@ -480,17 +541,29 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
               logRequest(logEntry);
             } else {
               // Record request for warmup tracking (with provider for smart warming)
-              modelWarmer.recordRequest(body.model, provider.id);
+    modelWarmer.recordRequest(body.model, provider.id);
 
-              // Try cache first (non-streaming only)
-              let cachedResponse = null;
-              if (!body.stream && responseCache.shouldCache(body)) {
-                const cacheKey = responseCache.generateKey(body);
-                cachedResponse = responseCache.get(cacheKey);
-              }
+    await acquireGlobalSlot();
+    let slotReleased = false;
+    const releaseSlot = () => {
+      if (!slotReleased) {
+        slotReleased = true;
+        releaseGlobalSlot();
+      }
+    };
+    try {
+      // Compute cache key once (non-streaming cacheable requests only)
+      const cacheKey = !body.stream && responseCache.shouldCache(body) ? responseCache.generateKey(body) : null;
+      // Try cache first (non-streaming only)
+      let cachedResponse = null;
+      if (cacheKey) {
+        cachedResponse = responseCache.get(cacheKey);
+      }
 
               if (cachedResponse) {
-                console.log(`[cache] HIT for model=${body.model}`);
+                if (isDebug()) {
+                  console.log(`[cache] HIT for model=${body.model}`);
+                }
                 const duration = Date.now() - startTime;
                 
                 const logEntry: Omit<LogEntry, 'id' | 'timestamp'> = {
@@ -513,34 +586,44 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
               }
 
               // Use hedging for non-streaming, low-temperature requests
-              const hedgingResult = await requestHedger.executeWithHedging(provider, body, config);
+              const hedgingResult = await requestHedger.executeWithHedging(provider, body, config, rawBody);
               const forwardResult = hedgingResult.response;
+              releaseSlot();
               const duration = Date.now() - startTime;
 
               // Cache successful non-streaming responses
-              if (!body.stream && forwardResult.status === 200 && responseCache.shouldCache(body)) {
-                const cacheKey = responseCache.generateKey(body);
+              if (cacheKey && forwardResult.status === 200) {
                 responseCache.set(cacheKey, forwardResult.body, forwardResult.status);
-                console.log(`[cache] SET for model=${body.model}`);
+                if (isDebug()) {
+                  console.log(`[cache] SET for model=${body.model}`);
+                }
               }
 
               if (forwardResult.streamResponse) {
                 const responseHeaders: Record<string, string> = {
-                  'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
-                  'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*',
+                  'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store',
+                  'Connection': 'keep-alive', 'X-Accel-Buffering': 'no',
+                  'Access-Control-Allow-Origin': '*',
                 };
                 res.writeHead(200, responseHeaders);
 
                 const reader = forwardResult.streamResponse.body!.getReader();
+                const onClientClose = () => {
+                  reader.cancel().catch(() => {});
+                };
+                req.once('close', onClientClose);
                 try {
                   while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    res.write(value);
+                    if (!res.write(value)) {
+                      await new Promise<void>(r => res.once('drain', r));
+                    }
                   }
                 } catch (err: any) {
                   console.error(`[stream] Pipe error: ${err.message}`);
                 } finally {
+                  req.off('close', onClientClose);
                   res.end();
                 }
 
@@ -575,12 +658,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
                 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*',
                 ...forwardResult.headers,
               };
-              writeResponse(res, forwardResult.status, responseBody, responseHeaders);
-              return;
+      writeResponse(res, forwardResult.status, responseBody, responseHeaders);
+      return;
+    
+  } finally {
+    releaseSlot();
+  }
             }
           }
         }
-      } catch (err: any) {
+} catch (err: any) {
+        if (err?.code === 'BODY_TOO_LARGE') {
+          result = jsonResponse({ error: { message: 'Request body exceeds maximum allowed size', code: 'body_too_large' } }, 413);
+        } else {
         console.error(`[error] POST /v1/chat/completions failed:`, err.message);
         const duration = Date.now() - startTime;
         const logEntry: Omit<LogEntry, 'id' | 'timestamp'> = {
@@ -591,6 +681,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         };
         logRequest(logEntry);
         result = jsonResponse({ error: { message: err.message, code: 'internal_error' } }, 500);
+        }
       }
     }
     else {
@@ -643,7 +734,13 @@ async function main() {
   }
 
   // Configure logger buffer based on config (mobile optimized: smaller buffer = less memory)
-  configureLogger(config.maxLogEntries || 1000);
+  configureLogger(config.maxLogEntries || 1000, config.logLevel);
+  configureGlobalGuard({
+    maxConcurrent: config.maxConcurrentRequests,
+    maxQueued: config.maxQueuedRequests,
+    queueTimeoutMs: config.queueTimeoutMs,
+  });
+  requestHedger.updateConfig(config.hedging || { enabled: false });
   if ((config.maxLogEntries || 1000) <= 200) {
     console.log(`[logger] Buffer size: ${config.maxLogEntries || 1000} entries (memory optimized)`);
   }
@@ -658,8 +755,8 @@ async function main() {
   setProviders(config.providers);
   initializeKeyStates(config);
   initializeRateLimiters(config.providers);
-  // Use configured health check interval (default 5000ms, mobile optimized via config)
-  const healthInterval = config.healthCheckIntervalMs || 5000;
+  // Use configured health check interval (default 60000ms, mobile optimized via config)
+  const healthInterval = config.healthCheckIntervalMs || 60000;
   startHealthCheckTimer(healthInterval);
   if (healthInterval > 10000) {
     console.log(`[health] Check interval: ${healthInterval}ms (battery optimized)`);
@@ -678,7 +775,11 @@ async function main() {
   const port = config.port || 8787;
   const host = config.host || process.env.HOST || '0.0.0.0';
   const server = createServer(handleRequest);
+  server.keepAliveTimeout = 60000;
+  server.headersTimeout = 65000;
   const isPublic = host === '0.0.0.0' || host === '::';
+
+  loadDashboardCache();
 
   server.listen(port, host, () => {
     console.log('');

@@ -172,10 +172,11 @@ export class ModelWarmer {
       );
     }
     
-    // Use provider's model patterns
+    // Use provider's model patterns, skipping glob patterns (e.g. "gpt-*", "nvidia/*").
+    // Only concrete model names can be warmed — POSTing a glob pattern as a model
+    // name guarantees a 4xx from every provider.
     const patterns = provider.modelPatterns || [`${provider.id}/*`];
-    // For now, return patterns as model identifiers
-    return patterns;
+    return patterns.filter(pattern => !pattern.includes('*') && !pattern.includes('?'));
   }
 
   /**
@@ -277,6 +278,26 @@ export class ModelWarmer {
       return; // No priority models to warm
     }
 
+    // Skip priority warmup when traffic is recent (same logic as regular warmup).
+    // No logging here — a skip is not an error condition.
+    if (this.config.skipIfRecentRequest) {
+      const now = Date.now();
+      let hasRecentRequest = false;
+
+      for (const model of priorityModels) {
+        const lastRequest = this.recentRequests.get(model) || 0;
+        if (now - lastRequest < this.config.recentRequestWindowMs) {
+          hasRecentRequest = true;
+          break;
+        }
+      }
+
+      if (hasRecentRequest) {
+        state.warmupStats.skippedCount++;
+        return;
+      }
+    }
+
     console.log(`[warmup] Priority warming ${provider.id} models: ${priorityModels.join(', ')}`);
     
     const semaphore = new Semaphore(this.config.concurrency);
@@ -342,7 +363,7 @@ export class ModelWarmer {
 
     const { buildUpstreamUrl, buildUpstreamHeaders } = await import('./forwarder');
     const { providerRateLimiter, parseRateLimitHeaders } = await import('./rate-limiter');
-    const { markKeySuccess, markKeyError } = await import('./key-pool');
+    const { markKeySuccess } = await import('./key-pool');
 
     const url = buildUpstreamUrl(provider);
     const headers = buildUpstreamHeaders(provider, key);
@@ -387,7 +408,10 @@ export class ModelWarmer {
         if (rateLimitInfo.limit || rateLimitInfo.remaining !== undefined || rateLimitInfo.resetMs || rateLimitInfo.retryAfterMs) {
           providerRateLimiter.updateFromHeaders(provider.id, keyHash, response.headers);
         }
-        markKeyError(provider.id, keyIndex, `HTTP ${response.status}`);
+        // Do NOT mark the key error here — a failed warmup (e.g. bogus model name,
+        // provider-side hiccup) must not put live keys into 60s cooldown and shrink
+        // the healthy key pool. Leave the key's health untouched; successful warmups
+        // still mark the key healthy via markKeySuccess above.
         state.warmupStats.failed++;
         state.warmupStats.lastError = `HTTP ${response.status}`;
         console.warn(`[warmup] ${provider.id}/${model} failed: ${response.status}`);
@@ -434,8 +458,43 @@ export class ModelWarmer {
       if (now - usage.lastUsed < this.config.priorityWindowMs) {
         usage.isPriority = true;
       }
-      
-      console.log(`[warmup] Recorded request for ${model} (provider: ${usage.providerId}, count: ${usage.useCount}, priority: ${usage.isPriority})`);
+    }
+
+    // Bound memory growth: prune stale entries on every insert
+    this.pruneTrackingMaps(now);
+  }
+
+  /**
+   * Prune unbounded tracking maps (recentRequests, modelUsage).
+   * Entries older than priorityWindowMs are removed; if a map still exceeds
+   * the cap, the oldest entries are evicted (LRU-style).
+   */
+  private pruneTrackingMaps(now: number): void {
+    const cutoff = now - this.config.priorityWindowMs;
+    const MAX_ENTRIES = 500;
+
+    if (this.recentRequests.size > 0) {
+      for (const [model, ts] of this.recentRequests) {
+        if (ts < cutoff) this.recentRequests.delete(model);
+      }
+      if (this.recentRequests.size > MAX_ENTRIES) {
+        const oldest = [...this.recentRequests.entries()].sort((a, b) => a[1] - b[1]);
+        for (let i = 0; i < oldest.length - MAX_ENTRIES; i++) {
+          this.recentRequests.delete(oldest[i][0]);
+        }
+      }
+    }
+
+    if (this.modelUsage.size > 0) {
+      for (const [model, usage] of this.modelUsage) {
+        if (usage.lastUsed < cutoff) this.modelUsage.delete(model);
+      }
+      if (this.modelUsage.size > MAX_ENTRIES) {
+        const oldest = [...this.modelUsage.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+        for (let i = 0; i < oldest.length - MAX_ENTRIES; i++) {
+          this.modelUsage.delete(oldest[i][0]);
+        }
+      }
     }
   }
 

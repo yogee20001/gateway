@@ -5,10 +5,8 @@
 // ============================================================
 
 import type { Provider, ChatCompletionRequest, AppConfig, ForwardResult, QueueConfig } from './types';
-import { getProviderKeys } from './config';
 import { getKeyHash, selectBestApiKey } from './key-pool';
 import { forwardWithRetry } from './forwarder';
-import { providerRateLimiter } from './rate-limiter';
 
 // ============================================================
 // Types
@@ -145,30 +143,25 @@ class RequestQueue {
     const queue = this.queues.get(providerId);
     if (!queue || queue.length === 0) return;
 
-    console.log(`[queue] Draining queue for ${providerId} (${queue.length} requests)`);
-
-    let processed = 0;
-    while (queue.length > 0) {
-      // Check if there's a healthy key available
-      const keyResult = selectBestApiKey(queue[0].provider);
-      if (!keyResult) {
-        // No healthy keys — stop draining for now
-        break;
-      }
-
-      const request = this.dequeue(providerId);
-      if (!request) break;
-
-      processed++;
-      this.totalDrained++;
-
-      // Process the request in the background
-      this.processQueuedRequest(request);
+  let processed = 0;
+  const BATCH_SIZE = 5;
+  while (queue.length > 0 && processed < BATCH_SIZE) {
+    const keyResult = selectBestApiKey(queue[0].provider);
+    if (!keyResult) {
+      break;
     }
-
-    if (processed > 0) {
-      console.log(`[queue] Drained ${processed} requests for ${providerId}`);
-    }
+    const request = this.dequeue(providerId);
+    if (!request) break;
+    processed++;
+    this.totalDrained++;
+    this.processQueuedRequest(request);
+  }
+  if (processed > 0) {
+    console.log(`[queue] Drained ${processed} requests for ${providerId}`);
+  }
+  if (queue.length > 0) {
+    setImmediate(() => this.drain(providerId));
+  }
   }
 
   /**

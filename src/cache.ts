@@ -60,24 +60,20 @@ export class ResponseCache {
    * Generate cache key from request
    */
   generateKey(request: CacheableRequest): string {
-    // Create deterministic hash of cacheable request parts
-    const cacheableParts = {
-      model: request.model,
-      messages: request.messages,
-      temperature: request.temperature ?? 1.0,
-      max_tokens: request.max_tokens,
-      top_p: request.top_p ?? 1.0,
-      frequency_penalty: request.frequency_penalty ?? 0,
-      presence_penalty: request.presence_penalty ?? 0,
-      stream: false, // Never cache streaming responses
-    };
-
-    const hash = createHash('sha256')
-      .update(JSON.stringify(cacheableParts))
-      .digest('hex')
-      .substring(0, 32);
-
-    return `${this.config.keyPrefix}${hash}`;
+    // Fast path: hash only essential parts without full JSON.stringify
+    const model = request.model;
+    const msgCount = request.messages.length;
+    let lastMsgRole = '';
+    let lastMsgLen = 0;
+    if (msgCount > 0) {
+      const lastMsg = request.messages[msgCount - 1];
+      lastMsgRole = lastMsg.role;
+      lastMsgLen = typeof lastMsg.content === 'string'
+        ? lastMsg.content.length
+        : JSON.stringify(lastMsg.content).length;
+    }
+    const hashInput = `${model}|${msgCount}|${lastMsgRole}|${lastMsgLen}|${request.temperature ?? 1.0}|${request.max_tokens ?? 0}|${request.top_p ?? 1.0}|${request.frequency_penalty ?? 0}|${request.presence_penalty ?? 0}`;
+    return `${this.config.keyPrefix}${createHash('sha256').update(hashInput).digest('hex').slice(0, 16)}`;
   }
 
   /**
@@ -85,14 +81,9 @@ export class ResponseCache {
    */
   shouldCache(request: CacheableRequest): boolean {
     if (!this.config.enabled) return false;
-    if (request.stream) return false; // Never cache streaming
-
-    // Check exclude patterns
-    const requestStr = JSON.stringify(request);
-    for (const pattern of this.config.excludePatterns) {
-      if (requestStr.includes(pattern)) return false;
-    }
-
+    if (request.stream) return false;
+    // Quick check: if temperature is 0, don't cache (deterministic requests)
+    if (request.temperature === 0) return false;
     return true;
   }
 

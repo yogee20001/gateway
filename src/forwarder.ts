@@ -3,9 +3,12 @@
 // ============================================================
 
 import type { Provider, ChatCompletionRequest, AppConfig } from './types';
-import { selectBestApiKey, markKeyRateLimited, markKeyError, markKeySuccess } from './key-pool';
+import { getKeyHash, selectBestApiKey, markKeyRateLimited, markKeyError, markKeySuccess } from './key-pool';
 import { calculateBackoff, isRetryableStatus, isRateLimitStatus, isServerErrorStatus } from './retry';
 import { providerRateLimiter, parseRateLimitHeaders, type ParsedRateLimitInfo } from './rate-limiter';
+
+// Note: Node's built-in fetch (undici) already pools connections with
+// keep-alive via its global dispatcher — no custom agent needed.
 
 // ============================================================
 // Upstream URL Builder
@@ -46,7 +49,8 @@ export function buildUpstreamHeaders(provider: Provider, key: string): Record<st
 // ============================================================
 export async function forwardNonStreaming(
   provider: Provider,
-  body: ChatCompletionRequest
+  body: ChatCompletionRequest,
+  rawBody?: string
 ): Promise<{ status: number; body: any; keyIndex: number; headers: Record<string, string> }> {
   const keyResult = selectBestApiKey(provider);
   if (!keyResult) {
@@ -59,11 +63,10 @@ export async function forwardNonStreaming(
   }
 
   // Wait for per-key rate limiter
-  const { getKeyHash } = await import('./key-pool');
   const keyHash = getKeyHash(keyResult.key);
   await providerRateLimiter.waitForSlot(provider.id, keyHash);
 
-  try {
+try {
   const url = buildUpstreamUrl(provider);
   const headers = buildUpstreamHeaders(provider, keyResult.key);
 
@@ -71,7 +74,7 @@ export async function forwardNonStreaming(
     const upstreamResponse = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: rawBody ?? JSON.stringify(body),
       signal: AbortSignal.timeout(120000),
     });
 
@@ -103,7 +106,7 @@ export async function forwardNonStreaming(
           || (typeof responseBody?.error?.message === 'string' && responseBody.error.message.includes('ResourceExhausted'))
           || (typeof responseBody?.error?.message === 'string' && responseBody.error.message.includes('Worker local total request limit reached'));
         if (isResourceExhausted) {
-          console.log('[forwarder] Provider returned ResourceExhausted in 200 response for ' + provider.id + ' key ' + keyResult.index + ' � treating as 429');
+          console.log('[forwarder] Provider returned ResourceExhausted in 200 response for ' + provider.id + ' key ' + keyResult.index + ' — treating as 429');
           return {
             status: 429,
             body: responseBody,
@@ -144,7 +147,8 @@ export async function forwardNonStreaming(
 // ============================================================
 export async function forwardStreaming(
   provider: Provider,
-  body: ChatCompletionRequest
+  body: ChatCompletionRequest,
+  rawBody?: string
 ): Promise<{ response: Response | null; status: number; body: any; keyIndex: number; headers: Record<string, string> }> {
   const keyResult = selectBestApiKey(provider);
   if (!keyResult) {
@@ -158,7 +162,6 @@ export async function forwardStreaming(
   }
 
   // Wait for per-key rate limiter
-  const { getKeyHash } = await import('./key-pool');
   const keyHash = getKeyHash(keyResult.key);
   await providerRateLimiter.waitForSlot(provider.id, keyHash);
 
@@ -166,15 +169,16 @@ export async function forwardStreaming(
   const url = buildUpstreamUrl(provider);
   const headers = buildUpstreamHeaders(provider, keyResult.key);
 
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
     const controller = new AbortController();
     // Timeout after 120s for initial response, but allow streaming to continue
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    timeoutId = setTimeout(() => controller.abort(), 120000);
 
     const upstreamResponse = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ ...body, stream: true }),
+      body: rawBody && /"stream"\s*:\s*true/.test(rawBody) ? rawBody : JSON.stringify({ ...body, stream: true }),
       signal: controller.signal,
     });
 
@@ -215,6 +219,7 @@ export async function forwardStreaming(
       headers: Object.fromEntries(upstreamResponse.headers.entries()),
     };
   } catch (err: any) {
+    clearTimeout(timeoutId);
     const errorMessage = err.name === 'TimeoutError' || err.name === 'AbortError'
       ? 'Upstream request timed out'
       : `Upstream request failed: ${err.message}`;
@@ -240,7 +245,8 @@ export async function forwardStreaming(
 export async function forwardWithRetry(
   provider: Provider,
   body: ChatCompletionRequest,
-  config: AppConfig
+  config: AppConfig,
+  rawBody?: string
 ): Promise<{
   status: number;
   body: any;
@@ -250,11 +256,11 @@ export async function forwardWithRetry(
   streamResponse: Response | null;
 }> {
   const isStreaming = body.stream === true;
-  const maxRetries = provider.maxRetries ?? config.defaultMaxRetries ?? 3;
+  const maxRetries = provider.maxRetries ?? config.defaultMaxRetries ?? 1;
   const cooldownMs = provider.cooldownMs ?? config.defaultCooldownMs ?? 60000;
 
   if (isStreaming) {
-    const result = await forwardStreaming(provider, body);
+    const result = await forwardStreaming(provider, body, rawBody);
     if (result.response) {
       return {
         status: result.status,
@@ -269,7 +275,7 @@ export async function forwardWithRetry(
     if (isRetryableStatus(result.status)) {
       const delay = calculateBackoff(0, 1000, 10000);
       await new Promise(resolve => setTimeout(resolve, delay));
-      const retryResult = await forwardStreaming(provider, body);
+      const retryResult = await forwardStreaming(provider, body, rawBody);
       if (retryResult.response) {
         return {
           status: retryResult.status,
@@ -304,7 +310,7 @@ export async function forwardWithRetry(
   let retries = 0;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await forwardNonStreaming(provider, body);
+    const result = await forwardNonStreaming(provider, body, rawBody);
     lastResult = result;
 
     if (result.status >= 200 && result.status < 300) {
@@ -316,7 +322,6 @@ export async function forwardWithRetry(
       
       if (isRateLimitStatus(result.status) && result.keyIndex >= 0) {
         markKeyRateLimited(provider.id, result.keyIndex, cooldownMs);
-        console.log(`[retry] Key ${result.keyIndex} rate-limited (429), attempt ${attempt + 1}/${maxRetries}`);
         
         // Check for Retry-After header in the response
         const retryAfter = result.headers?.['retry-after'];
@@ -324,26 +329,21 @@ export async function forwardWithRetry(
           const seconds = parseInt(retryAfter, 10);
           if (!isNaN(seconds) && seconds > 0) {
             delay = seconds * 1000;
-            console.log(`[retry] Upstream Retry-After: ${seconds}s, using that for backoff`);
           }
         }
         
         // If no Retry-After, use exponential backoff with jitter
         if (delay === 0) {
           delay = calculateBackoff(attempt, 2000, 30000);
-          console.log(`[retry] Using exponential backoff: ${delay}ms`);
         }
       } else if (isServerErrorStatus(result.status) && result.keyIndex >= 0) {
-        console.log(`[retry] Key ${result.keyIndex} server error ${result.status}, attempt ${attempt + 1}/${maxRetries}`);
         delay = calculateBackoff(attempt, 1000, 10000);
-        console.log(`[retry] Server error backoff: ${delay}ms`);
       }
 
       retries = attempt + 1;
 
       if (attempt < maxRetries) {
         if (delay > 0) {
-          console.log(`[retry] Waiting ${delay}ms before retry ${attempt + 2}`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }

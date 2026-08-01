@@ -6,6 +6,15 @@ import type { AppConfig, Provider, ProviderMatch } from './types';
 import { inferProviderPatternsFromId } from './config';
 
 // ============================================================
+// Model-to-Provider Cache
+// ============================================================
+const modelProviderCache: Map<string, ProviderMatch[]> = new Map();
+// The cache is only valid while the config object identity is unchanged.
+// Config is replaced wholesale on load and on dashboard save, so any
+// new object (new identity) invalidates the cache automatically.
+let cachedConfigRef: AppConfig | null = null;
+
+// ============================================================
 // Pattern Matching
 // ============================================================
 export function matchModelPattern(modelName: string, pattern: string): boolean {
@@ -58,6 +67,14 @@ export function calculateSpecificity(pattern: string): number {
 }
 
 export function findProvidersForModel(requestedModel: string, config: AppConfig): ProviderMatch[] {
+  // Config replaced since last lookup? Drop the whole cache (identity check).
+  if (config !== cachedConfigRef) {
+    modelProviderCache.clear();
+    cachedConfigRef = config;
+  }
+  const cached = modelProviderCache.get(requestedModel);
+  if (cached) return cached;
+
   const matches: ProviderMatch[] = [];
 
   for (const provider of config.providers) {
@@ -79,7 +96,12 @@ export function findProvidersForModel(requestedModel: string, config: AppConfig)
     }
   }
 
-  // Sort by specificity descending (most specific first)
-  matches.sort((a, b) => b.specificity - a.specificity);
-  return matches;
+// Sort by specificity descending (most specific first)
+matches.sort((a, b) => b.specificity - a.specificity);
+modelProviderCache.set(requestedModel, matches);
+return matches;
+}
+
+export function invalidateModelCache(): void {
+  modelProviderCache.clear();
 }

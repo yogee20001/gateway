@@ -141,14 +141,16 @@ class StatsAccumulator {
 // ============================================================
 let logBuffer = new LogRingBuffer(1000);
 const stats = new StatsAccumulator();
+let currentLogLevel: LogLevel = 'info';
 
 /**
  * Configure the logger buffer size (call during startup with config.maxLogEntries)
  * Reduces memory usage on mobile devices
  */
-export function configureLogger(maxEntries: number = 1000): void {
+export function configureLogger(maxEntries: number = 1000, logLevel?: LogLevel): void {
   const effectiveMax = Math.max(50, Math.min(maxEntries, 10000));
   logBuffer = new LogRingBuffer(effectiveMax);
+  if (logLevel) currentLogLevel = logLevel;
 }
 
 // ============================================================
@@ -170,15 +172,26 @@ export function logRequest(entry: Omit<LogEntry, 'id' | 'timestamp'>): void {
   logBuffer.push(fullEntry);
   stats.recordRequest(fullEntry);
 
-  // Console log
-  const time = new Date().toLocaleTimeString();
-  const statusColor = entry.status >= 200 && entry.status < 300 ? '✓' :
-                      entry.status >= 400 && entry.status < 500 ? '⚠' : '✗';
-  console.log(
-    `[${time}] ${statusColor} ${entry.method} ${entry.path}  ` +
-    `model=${entry.model}  → ${entry.provider}  → ${entry.status} (${entry.duration}ms)` +
-    (entry.retries > 0 ? ` ⚠ retry ${entry.retries}` : '')
-  );
+  // Console log — gated: per-request lines print only at 'debug' level to
+  // avoid blocking console writes on the hot path. Errors stay visible at
+  // 'error'/'warn' levels.
+  const isWarn = entry.status >= 400 && entry.status < 500;
+  const isError = entry.status >= 500;
+  const printEntry =
+    currentLogLevel === 'debug' ||
+    (currentLogLevel === 'warn' && (isWarn || isError)) ||
+    (currentLogLevel === 'error' && isError);
+
+  if (printEntry) {
+    const time = new Date(fullEntry.timestamp).toISOString().slice(11, 23);
+    const statusColor = entry.status >= 200 && entry.status < 300 ? '✓' :
+                        entry.status >= 400 && entry.status < 500 ? '⚠' : '✗';
+    console.log(
+      `[${time}] ${statusColor} ${entry.method} ${entry.path}  ` +
+      `model=${entry.model}  → ${entry.provider}  → ${entry.status} (${entry.duration}ms)` +
+      (entry.retries > 0 ? ` ⚠ retry ${entry.retries}` : '')
+    );
+  }
 }
 
 export function getRecentLogs(count: number = 100): LogEntry[] {
@@ -214,7 +227,7 @@ const LOG_COLORS: Record<LogLevel, string> = {
 const LOG_RESET = '\x1b[0m';
 
 export function consoleLog(level: LogLevel, message: string, data?: any): void {
-  const time = new Date().toLocaleTimeString();
+  const time = new Date().toISOString().slice(11, 23);
   const color = LOG_COLORS[level] || LOG_COLORS.info;
   const prefix = level.toUpperCase().padEnd(5);
   const dataStr = data ? ` ${JSON.stringify(data)}` : '';
