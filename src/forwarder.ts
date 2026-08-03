@@ -143,12 +143,83 @@ try {
 }
 
 // ============================================================
+// First-Chunk Peek — fail fast on empty/dead upstream streams
+// ============================================================
+export type PeekResult =
+  | { ok: true; stream: ReadableStream<Uint8Array> }
+  | { ok: false; error: string; code: 'upstream_empty_stream' | 'upstream_stream_timeout' | 'upstream_stream_error' };
+
+/**
+ * Reads the first chunk of a streaming response with a timeout.
+ * - Body ends immediately (zero bytes)           -> upstream_empty_stream
+ * - No bytes within timeoutMs                    -> upstream_stream_timeout
+ * - Read throws                                  -> upstream_stream_error
+ * On success returns a re-wrapped stream that replays the peeked chunk and
+ * pipes the remainder, so callers can still stream the full body.
+ */
+export async function peekFirstChunk(response: Response, timeoutMs: number): Promise<PeekResult> {
+  if (!response.body) {
+    return { ok: false, error: 'Upstream response has no body', code: 'upstream_stream_error' };
+  }
+  const reader = response.body.getReader();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    reader.cancel().catch(() => {});
+  }, timeoutMs);
+
+  let first: ReadableStreamReadResult<Uint8Array>;
+  try {
+    first = await reader.read();
+  } catch (err: any) {
+    clearTimeout(timer);
+    const message = timedOut
+      ? `No data received from upstream within ${timeoutMs}ms`
+      : `Upstream stream read failed: ${err?.message ?? err}`;
+    return { ok: false, error: message, code: timedOut ? 'upstream_stream_timeout' : 'upstream_stream_error' };
+  }
+  clearTimeout(timer);
+
+  if (timedOut) {
+    return { ok: false, error: `No data received from upstream within ${timeoutMs}ms`, code: 'upstream_stream_timeout' };
+  }
+
+  if (first.done) {
+    return { ok: false, error: 'Upstream returned an empty stream (no SSE data)', code: 'upstream_empty_stream' };
+  }
+
+  const firstChunk = first.value;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(firstChunk);
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err: any) {
+        controller.error(err);
+      }
+    },
+    cancel() {
+      reader.cancel().catch(() => {});
+    },
+  });
+  return { ok: true, stream };
+}
+
+// ============================================================
 // Forward Streaming Request — returns raw Response for SSE piping
 // ============================================================
 export async function forwardStreaming(
   provider: Provider,
   body: ChatCompletionRequest,
-  rawBody?: string
+  rawBody?: string,
+  firstTokenTimeoutMs: number = 180000
 ): Promise<{ response: Response | null; status: number; body: any; keyIndex: number; headers: Record<string, string> }> {
   const keyResult = selectBestApiKey(provider);
   if (!keyResult) {
@@ -187,9 +258,26 @@ export async function forwardStreaming(
 
     // Parse rate limit headers from upstream
     if (status >= 200 && status < 300) {
+      // Peek the first chunk: fail fast on empty streams instead of
+      // returning a "successful" stream that delivers zero content.
+      const peek = await peekFirstChunk(upstreamResponse, firstTokenTimeoutMs);
+      if (!peek.ok) {
+        markKeyError(provider.id, keyResult.index, peek.error);
+        return {
+          response: null,
+          status: 504,
+          body: { error: { message: peek.error, code: peek.code } },
+          keyIndex: keyResult.index,
+          headers: { 'Content-Type': 'application/json' },
+        };
+      }
       markKeySuccess(provider.id, keyResult.index);
       return {
-        response: upstreamResponse,
+        response: new Response(peek.stream, {
+          status,
+          statusText: upstreamResponse.statusText,
+          headers: upstreamResponse.headers,
+        }),
         status,
         body: null,
         keyIndex: keyResult.index,
@@ -258,9 +346,10 @@ export async function forwardWithRetry(
   const isStreaming = body.stream === true;
   const maxRetries = provider.maxRetries ?? config.defaultMaxRetries ?? 1;
   const cooldownMs = provider.cooldownMs ?? config.defaultCooldownMs ?? 60000;
+  const firstTokenTimeoutMs = config.streamFirstTokenTimeoutMs ?? 180000;
 
   if (isStreaming) {
-    const result = await forwardStreaming(provider, body, rawBody);
+    const result = await forwardStreaming(provider, body, rawBody, firstTokenTimeoutMs);
     if (result.response) {
       return {
         status: result.status,
@@ -275,7 +364,7 @@ export async function forwardWithRetry(
     if (isRetryableStatus(result.status)) {
       const delay = calculateBackoff(0, 1000, 10000);
       await new Promise(resolve => setTimeout(resolve, delay));
-      const retryResult = await forwardStreaming(provider, body, rawBody);
+      const retryResult = await forwardStreaming(provider, body, rawBody, firstTokenTimeoutMs);
       if (retryResult.response) {
         return {
           status: retryResult.status,

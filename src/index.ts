@@ -612,19 +612,50 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
                   reader.cancel().catch(() => {});
                 };
                 req.once('close', onClientClose);
+
+                // Rolling idle timeout: abort if no bytes arrive for streamIdleTimeoutMs
+                const idleTimeoutMs = config.streamIdleTimeoutMs ?? 120000;
+                let idleTimer: ReturnType<typeof setTimeout> | undefined;
+                let idleTimedOut = false;
+                let bytesReceived = 0;
+                const armIdleTimer = () => {
+                  clearTimeout(idleTimer);
+                  idleTimer = setTimeout(() => {
+                    idleTimedOut = true;
+                    reader.cancel().catch(() => {});
+                  }, idleTimeoutMs);
+                };
+
                 try {
+                  armIdleTimer();
                   while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    if (!res.write(value)) {
+                    let chunk: ReadableStreamReadResult<Uint8Array>;
+                    try {
+                      chunk = await reader.read();
+                    } catch (err: any) {
+                      if (idleTimedOut) {
+                        throw new Error(`Stream idle timeout after ${idleTimeoutMs}ms`);
+                      }
+                      throw err;
+                    }
+                    if (chunk.done) break;
+                    clearTimeout(idleTimer);
+                    bytesReceived += chunk.value.byteLength;
+                    if (!res.write(chunk.value)) {
                       await new Promise<void>(r => res.once('drain', r));
                     }
+                    armIdleTimer();
                   }
                 } catch (err: any) {
                   console.error(`[stream] Pipe error: ${err.message}`);
                 } finally {
+                  clearTimeout(idleTimer);
                   req.off('close', onClientClose);
                   res.end();
+                }
+
+                if (bytesReceived === 0) {
+                  console.error('[stream] WARNING: stream delivered zero bytes to client');
                 }
 
                 const logEntry: Omit<LogEntry, 'id' | 'timestamp'> = {
@@ -633,7 +664,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
                   keyHash: forwardResult.keyIndex >= 0 ? `key-${forwardResult.keyIndex}` : 'none',
                   keyMasked: forwardResult.keyIndex >= 0 ? `key-${forwardResult.keyIndex}` : 'none',
                   status: 200, duration, retries: forwardResult.retries, streamed: true,
-                  error: null, requestPreview: JSON.stringify(body).substring(0, 200),
+                  error: bytesReceived === 0 ? 'empty stream delivered' : null,
+                  requestPreview: JSON.stringify(body).substring(0, 200),
                   responsePreview: '[streaming response]',
                 };
                 logRequest(logEntry);

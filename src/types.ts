@@ -65,6 +65,10 @@ export interface AppConfig {
   queueTimeoutMs?: number;
   /** Max request body size in bytes for /v1/chat/completions (default: 10 MB) */
   maxBodyBytes?: number;
+  /** Max time (ms) to wait for the FIRST SSE chunk from upstream before failing (default: 180000) */
+  streamFirstTokenTimeoutMs?: number;
+  /** Max idle time (ms) between SSE chunks during streaming before aborting (default: 120000) */
+  streamIdleTimeoutMs?: number;
   /** Hedging behavior (default: disabled) */
   hedging?: HedgingSettings;
   providers: Provider[];

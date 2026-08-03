@@ -85,6 +85,8 @@ export function createDefaultConfig(): AppConfig {
     maxQueuedRequests: 100,
     queueTimeoutMs: 30000,
     maxBodyBytes: 10485760,
+    streamFirstTokenTimeoutMs: 180000,
+    streamIdleTimeoutMs: 120000,
     hedging: { enabled: false },
     providers: DEFAULT_PROVIDERS.map(p => ({ ...p, apiKeys: [...(p.apiKeys || [])], rateLimit: null })),
   };
@@ -103,6 +105,7 @@ export function loadConfig(filePath?: string): AppConfig | null {
   try {
     const raw = readFileSync(path, 'utf-8');
     const config = JSON.parse(raw) as AppConfig;
+    applyEnvKeyOverrides(config);
     return config;
   } catch (err) {
     console.error('❌ Failed to parse config.json:', (err as Error).message);
@@ -144,6 +147,8 @@ export function validateConfig(config: AppConfig): ValidationResult {
     ['maxQueuedRequests', config.maxQueuedRequests],
     ['queueTimeoutMs', config.queueTimeoutMs],
     ['maxBodyBytes', config.maxBodyBytes],
+    ['streamFirstTokenTimeoutMs', config.streamFirstTokenTimeoutMs],
+    ['streamIdleTimeoutMs', config.streamIdleTimeoutMs],
     ['healthCheckIntervalMs', config.healthCheckIntervalMs],
     ['defaultMaxRetries', config.defaultMaxRetries],
     ['defaultCooldownMs', config.defaultCooldownMs],
@@ -242,4 +247,27 @@ export function getProviderKeys(provider: Provider): string[] {
     keys.push(...provider.apiKeys.filter(k => typeof k === 'string' && k.length > 0));
   }
   return keys;
+}
+
+// ============================================================
+// Environment Variable Key Overrides (security: keys out of config.json)
+// ============================================================
+/**
+ * If AI_GATEWAY_<PROVIDER_ID>_KEYS (comma-separated) is set in the
+ * environment, it REPLACES the provider's keys from config.json.
+ * Example: AI_GATEWAY_NVIDIA_KEYS="nvapi-a,nvapi-b"
+ */
+export function applyEnvKeyOverrides(config: AppConfig): void {
+  for (const provider of config.providers || []) {
+    const envName = `AI_GATEWAY_${provider.id.toUpperCase()}_KEYS`;
+    const envKeys = process.env[envName];
+    if (!envKeys || envKeys.trim().length === 0) continue;
+    const keys = envKeys.split(',').map(k => k.trim()).filter(k => k.length > 0);
+    if (keys.length === 0) continue;
+    provider.apiKeys = keys;
+    provider.apiKey = null; // getProviderKeys pushes apiKey first; avoid duplicates
+    if (config.logLevel === 'debug') {
+      console.log(`[config] Loaded ${keys.length} key(s) for provider '${provider.id}' from env ${envName}`);
+    }
+  }
 }
